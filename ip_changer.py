@@ -45,6 +45,8 @@ PROXY_SOURCES = [
 
 # Plain HTTP — free proxies almost never support HTTPS tunneling (CONNECT)
 TEST_URL        = "http://ip-api.com/json/"
+# Secondary check: proxy must also reach a real website, not just the IP-lookup API
+SECONDARY_TEST_URL = "http://example.com"
 TEST_TIMEOUT    = 7      # seconds per proxy test
 TEST_WORKERS    = 14     # concurrent test threads
 QUEUE_LOW_MARK  = 5      # refetch when queue drops below this
@@ -189,14 +191,22 @@ class ProxyManager:
                 return
             try:
                 p = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+
+                # Step 1: get the proxy's IP via ip-api
                 r = requests.get(TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
                 if r.status_code != 200:
                     return
-                # Validate the response actually contains an IP address
                 data = r.json()
                 ip = data.get("query", "")
                 if not ip or "." not in ip:
                     return
+
+                # Step 2: confirm the proxy can reach a real website, not just the
+                # IP-lookup API. Filters proxies that only answer whitelisted endpoints.
+                r2 = requests.get(SECONDARY_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
+                if r2.status_code not in (200, 301, 302):
+                    return
+
                 should_add = False
                 with self._seen_lock:
                     if proxy not in self._seen:
@@ -481,13 +491,13 @@ class App:
         self._interval_var = tk.StringVar(value="30")
         self._interval_cb = ttk.Combobox(
             ctrl, textvariable=self._interval_var,
-            values=["15", "30", "45", "60", "90", "120"],
-            width=5, font=("Segoe UI", 10), state="readonly",
+            values=["Manual", "15", "30", "45", "60", "90", "120"],
+            width=7, font=("Segoe UI", 10), state="readonly",
         )
         self._interval_cb.pack(side="left", padx=6)
 
         tk.Label(ctrl,
-                 text="seconds   |   waits automatically if no proxy is ready yet",
+                 text="seconds   |   'Manual' = no auto-rotate, use Next Proxy button",
                  bg=C["bg"], fg=C["hint"], font=("Segoe UI", 9)).pack(side="left")
 
         # ── Buttons ──
@@ -502,7 +512,7 @@ class App:
         self._start_btn.pack(side="left", padx=5)
 
         self._next_btn = tk.Button(
-            btn_row, text="Skip → Next IP", command=self._force_rotate,
+            btn_row, text="→ Next Proxy", command=self._force_rotate,
             bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
             font=("Segoe UI", 10), padx=12, pady=7, state="disabled",
         )
@@ -847,10 +857,12 @@ class App:
 
     def _start(self):
         self._running = True
-        self._start_btn.config(text="■  Stop Rotation", bg=C["red"], fg="#1e1e2e")
+        manual = self._interval_var.get() == "Manual"
+        self._start_btn.config(text="■  Stop", bg=C["red"], fg="#1e1e2e")
         self._next_btn.config(state="normal")
         self._interval_cb.config(state="disabled")
-        self._log("Rotation started — background proxy fetcher running.")
+        mode_msg = "Manual mode — use '→ Next Proxy' to rotate." if manual else "Rotation started — background proxy fetcher running."
+        self._log(mode_msg)
         self._manager.start()
         self._rotation_thread = threading.Thread(
             target=self._rotation_loop, daemon=True, name="rotator")
@@ -896,17 +908,27 @@ class App:
         self._do_wait_and_rotate()
 
         while self._running:
+            if self._interval_var.get() == "Manual":
+                # No auto-rotation — proxy stays until user clicks Next Proxy
+                self.root.after(0, self._cd_var.set,
+                                "Manual mode — click '→ Next Proxy' whenever you want to rotate")
+                self.root.after(0, self._progress.__setitem__, "value", 0)
+                time.sleep(1)
+                continue
+
             interval = int(self._interval_var.get())
 
             # Countdown
             for remaining in range(interval, 0, -1):
                 if not self._running:
                     break
+                if self._interval_var.get() == "Manual":
+                    break
                 pct = (1 - remaining / interval) * 100
                 self.root.after(0, self._set_countdown, remaining, pct)
                 time.sleep(1)
 
-            if self._running:
+            if self._running and self._interval_var.get() != "Manual":
                 self._do_wait_and_rotate()
 
         # Cleanup

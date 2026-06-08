@@ -213,70 +213,47 @@ class ProxyManager:
 # ── Cookie Randomizer ────────────────────────────────────────────────────────
 
 class CookieRandomizer:
-    """Generates realistic random browser cookies for multi-browser / anti-detect setups."""
+    """
+    Generates a realistic multi-site browsing history for Multilogin / AdsPower profiles.
+    All cookies are client-side analytics only — no fake server-validated tokens.
+    Timestamps are spread over the chosen profile age so the browser looks genuinely used.
+    """
 
-    _SAMESITES = ["Lax", "Strict", "None"]
-
-    # Templates: (name_pattern, value_factory, httpOnly, secure)
-    _ANALYTICS = [
-        ("_ga",       lambda: f"GA1.{random.randint(1,3)}.{random.randint(10**9,10**10-1)}.{random.randint(10**9,10**10-1)}", False, False),
-        ("_gid",      lambda: f"GA1.{random.randint(1,3)}.{random.randint(10**9,10**10-1)}.{random.randint(10**9,10**10-1)}", False, False),
-        ("_gat",      lambda: "1",                                                                                              False, False),
-        ("_fbp",      lambda: f"fb.1.{int(time.time()*1000)}.{random.randint(10**8,10**9-1)}",                                 False, False),
-        ("_fbc",      lambda: f"fb.1.{int(time.time()*1000)}.IwAR{CookieRandomizer._b64token(24)}",                           False, False),
-        ("__utma",    lambda: f"{random.randint(10**8,10**9-1)}.{random.randint(10**9,10**10-1)}.{int(time.time())}.{int(time.time())}.{int(time.time())}.{random.randint(1,30)}", False, False),
-        ("__utmb",    lambda: f"{random.randint(10**8,10**9-1)}.1.10.{int(time.time())}",                                      False, False),
-        ("__utmz",    lambda: f"{random.randint(10**8,10**9-1)}.{int(time.time())}.1.1.utmcsr=(direct)|utmccn=(direct)|utmcmd=(none)", False, False),
-        ("_hjid",     lambda: str(uuid.uuid4()),                                                                               False, False),
-        ("_hjFirstSeen", lambda: "1",                                                                                          False, False),
+    # Sites a normal person visits; flagged with whether they use FB pixel & Hotjar
+    # (domain, uses_fbp, uses_hotjar, uses_ga4)
+    _SITES = [
+        ("google.com",      False, False, True),
+        ("youtube.com",     False, False, True),
+        ("reddit.com",      True,  False, True),
+        ("amazon.com",      True,  False, True),
+        ("facebook.com",    True,  False, False),
+        ("instagram.com",   True,  False, False),
+        ("twitter.com",     False, False, True),
+        ("linkedin.com",    True,  True,  True),
+        ("netflix.com",     False, False, True),
+        ("wikipedia.org",   False, False, False),
+        ("github.com",      False, True,  True),
+        ("pinterest.com",   True,  False, True),
+        ("ebay.com",        True,  True,  True),
+        ("etsy.com",        True,  True,  True),
+        ("spotify.com",     False, True,  True),
+        ("twitch.tv",       True,  False, True),
+        ("microsoft.com",   False, False, True),
+        ("apple.com",       False, False, True),
+        ("cnn.com",         True,  False, True),
+        ("nytimes.com",     True,  True,  True),
+        ("quora.com",       True,  True,  True),
+        ("stackoverflow.com",False,True,  True),
+        ("medium.com",      True,  True,  True),
+        ("shopify.com",     True,  True,  True),
+        ("wordpress.com",   False, True,  True),
     ]
 
-    _SESSION = [
-        ("sessionid",    lambda: CookieRandomizer._hextoken(32),  True,  True),
-        ("session_token",lambda: CookieRandomizer._hextoken(40),  True,  True),
-        ("PHPSESSID",    lambda: CookieRandomizer._hextoken(26),  True,  False),
-        ("JSESSIONID",   lambda: CookieRandomizer._hextoken(32).upper(), True, False),
-        ("ASP.NET_SessionId", lambda: CookieRandomizer._alphanum(24), True, False),
-        ("connect.sid",  lambda: f"s%3A{CookieRandomizer._hextoken(40)}.{CookieRandomizer._hextoken(20)}", True, True),
-        ("sid",          lambda: CookieRandomizer._hextoken(32),  True,  True),
-    ]
-
-    _AUTH = [
-        ("auth_token",   lambda: CookieRandomizer._hextoken(40),  True,  True),
-        ("access_token", lambda: CookieRandomizer._jwt_like(),     True,  True),
-        ("refresh_token",lambda: CookieRandomizer._hextoken(64),  True,  True),
-        ("remember_token",lambda: CookieRandomizer._hextoken(40), True,  True),
-        ("_csrf",        lambda: CookieRandomizer._b64token(32),   False, True),
-        ("csrftoken",    lambda: CookieRandomizer._alphanum(64),   False, False),
-        ("XSRF-TOKEN",   lambda: CookieRandomizer._b64token(32),   False, True),
-    ]
-
-    _TRACKING = [
-        ("__cf_bm",     lambda: f"{CookieRandomizer._b64token(40)}-{int(time.time())}-{random.randint(0,9)}", False, True),
-        ("cf_clearance",lambda: f"{CookieRandomizer._hextoken(40)}-{int(time.time())}-0-{random.randint(100,999)}", False, True),
-        ("_dd_s",       lambda: f"rum=0&expire={int(time.time()*1000)+3600000}", False, False),
-        ("OptanonConsent", lambda: f"isIABGlobal=false&datestamp={datetime.utcnow().strftime('%a+%b+%d+%Y+%H%%3A%M%%3A%S+GMT%%2B0000')}&version=6.{random.randint(10,39)}.0", False, False),
-        ("CookieConsent", lambda: f"{{stamp:'{CookieRandomizer._alphanum(28)}',necessary:true,preferences:true,statistics:true,marketing:false}}", False, False),
-        ("euconsent-v2", lambda: CookieRandomizer._b64token(80),  False, False),
-    ]
-
-    _PREFS = [
-        ("theme",       lambda: random.choice(["light","dark","system"]), False, False),
-        ("lang",        lambda: random.choice(["en","en-US","fr","de","es","pt","it","ja","ko","zh"]), False, False),
-        ("locale",      lambda: random.choice(["en_US","fr_FR","de_DE","es_ES","pt_BR"]), False, False),
-        ("currency",    lambda: random.choice(["USD","EUR","GBP","JPY","CAD"]), False, False),
-        ("timezone",    lambda: random.choice(["UTC","America/New_York","Europe/London","Asia/Tokyo","America/Los_Angeles"]).replace("/","%2F"), False, False),
-    ]
-
-    # ── Static helpers ────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _hextoken(n: int) -> str:
         return ''.join(random.choices('0123456789abcdef', k=n))
-
-    @staticmethod
-    def _alphanum(n: int) -> str:
-        return ''.join(random.choices(string.ascii_letters + string.digits, k=n))
 
     @staticmethod
     def _b64token(n: int) -> str:
@@ -284,56 +261,133 @@ class CookieRandomizer:
         return base64.urlsafe_b64encode(raw).decode()[:n]
 
     @staticmethod
-    def _jwt_like() -> str:
-        header  = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').decode().rstrip("=")
-        payload = base64.urlsafe_b64encode(
-            json.dumps({"sub": str(random.randint(10**5, 10**9)),
-                        "iat": int(time.time()),
-                        "exp": int(time.time()) + 3600}).encode()
-        ).decode().rstrip("=")
-        sig = CookieRandomizer._b64token(43)
-        return f"{header}.{payload}.{sig}"
+    def _ts(days_ago_max: int, days_ago_min: int = 0) -> int:
+        """Random Unix timestamp between days_ago_min and days_ago_max days ago."""
+        now = int(time.time())
+        offset = random.randint(int(days_ago_min * 86400), int(days_ago_max * 86400))
+        return now - offset
+
+    @staticmethod
+    def _future_ts(days: int) -> int:
+        return int(time.time()) + days * 86400
+
+    # ── Per-site cookie builders ──────────────────────────────────────────────
+
+    def _ga_cookies(self, domain: str, first_visit: int, age_days: int) -> list[dict]:
+        """Google Analytics 4 + UA cookies for one domain."""
+        cid    = f"{random.randint(10**9, 10**10-1)}.{first_visit}"
+        net    = random.randint(1, 3)
+        cookies = [
+            {
+                "name":     "_ga",
+                "value":    f"GA1.{net}.{cid}",
+                "domain":   f".{domain}",
+                "path":     "/",
+                "expires":  self._future_ts(730),
+                "httpOnly": False,
+                "secure":   False,
+                "sameSite": "Lax",
+            },
+            {
+                "name":     f"_ga_{self._hextoken(8).upper()[:8]}",
+                "value":    f"GS1.1.{self._ts(1)}.{random.randint(1,30)}.1.{self._ts(0,0)}.0.0.0",
+                "domain":   f".{domain}",
+                "path":     "/",
+                "expires":  self._future_ts(730),
+                "httpOnly": False,
+                "secure":   False,
+                "sameSite": "Lax",
+            },
+            {
+                "name":     "_gid",
+                "value":    f"GA1.{net}.{random.randint(10**9,10**10-1)}.{self._ts(0)}",
+                "domain":   f".{domain}",
+                "path":     "/",
+                "expires":  self._future_ts(1),
+                "httpOnly": False,
+                "secure":   False,
+                "sameSite": "Lax",
+            },
+        ]
+        return cookies
+
+    def _fbp_cookie(self, domain: str, first_visit: int) -> dict:
+        return {
+            "name":     "_fbp",
+            "value":    f"fb.1.{first_visit * 1000}.{random.randint(10**8, 10**9-1)}",
+            "domain":   f".{domain}",
+            "path":     "/",
+            "expires":  self._future_ts(90),
+            "httpOnly": False,
+            "secure":   False,
+            "sameSite": "Lax",
+        }
+
+    def _hjid_cookies(self, domain: str) -> list[dict]:
+        hjid = str(uuid.uuid4())
+        return [
+            {
+                "name":     "_hjid",
+                "value":    hjid,
+                "domain":   f".{domain}",
+                "path":     "/",
+                "expires":  self._future_ts(365),
+                "httpOnly": False,
+                "secure":   False,
+                "sameSite": "Lax",
+            },
+            {
+                "name":     "_hjSessionUser_" + str(random.randint(1000000, 9999999)),
+                "value":    json.dumps({"id": hjid, "created": self._ts(1), "future": False}),
+                "domain":   f".{domain}",
+                "path":     "/",
+                "expires":  self._future_ts(365),
+                "httpOnly": False,
+                "secure":   False,
+                "sameSite": "Lax",
+            },
+        ]
+
+    def _consent_cookie(self, domain: str) -> dict:
+        stamp = self._b64token(28)
+        return {
+            "name":     "OptanonAlertBoxClosed",
+            "value":    datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "domain":   f".{domain}",
+            "path":     "/",
+            "expires":  self._future_ts(365),
+            "httpOnly": False,
+            "secure":   False,
+            "sameSite": "Lax",
+        }
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def generate(self, domain: str, count: int, categories: list[str]) -> list[dict]:
-        pool: list[tuple] = []
-        if "analytics" in categories:  pool += self._ANALYTICS
-        if "session"   in categories:  pool += self._SESSION
-        if "auth"      in categories:  pool += self._AUTH
-        if "tracking"  in categories:  pool += self._TRACKING
-        if "prefs"     in categories:  pool += self._PREFS
+    def generate_profile(self, age_days: int, site_count: int) -> list[dict]:
+        """
+        Build a full browsing-history cookie set for a Multilogin profile.
+        age_days  — how old the profile should look (e.g. 90 = visited sites over past 3 months)
+        site_count — how many sites to include (sampled from _SITES)
+        """
+        sites = random.sample(self._SITES, min(site_count, len(self._SITES)))
+        all_cookies: list[dict] = []
 
-        if not pool:
-            return []
+        for domain, uses_fbp, uses_hj, uses_ga in sites:
+            # Spread first-visit timestamps across the profile age
+            first_visit = self._ts(age_days, max(1, age_days // 4))
 
-        now = datetime.utcnow()
-        cookies = []
-        used_names: set[str] = set()
+            if uses_ga:
+                all_cookies += self._ga_cookies(domain, first_visit, age_days)
+            if uses_fbp:
+                all_cookies.append(self._fbp_cookie(domain, first_visit))
+            if uses_hj:
+                all_cookies += self._hjid_cookies(domain)
+            if random.random() < 0.4:
+                all_cookies.append(self._consent_cookie(domain))
 
-        for _ in range(count):
-            template = random.choice(pool)
-            name, value_fn, http_only, secure = template
-            # avoid duplicate names in the same batch
-            suffix = f"_{CookieRandomizer._alphanum(4)}" if name in used_names else ""
-            used_names.add(name)
-            name_final = name + suffix
-
-            expires_ts = int((now + timedelta(days=random.randint(1, 730))).timestamp())
-
-            cookie = {
-                "name":     name_final,
-                "value":    value_fn(),
-                "domain":   domain if domain.startswith(".") else f".{domain}" if domain else ".example.com",
-                "path":     "/",
-                "expires":  expires_ts,
-                "httpOnly": http_only,
-                "secure":   secure,
-                "sameSite": "None" if (secure and random.random() < 0.3) else random.choice(["Lax", "Strict"]),
-            }
-            cookies.append(cookie)
-
-        return cookies
+        # Sort by domain so Multilogin import is tidy
+        all_cookies.sort(key=lambda c: c["domain"])
+        return all_cookies
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -493,81 +547,80 @@ class App:
         hdr.pack(fill="x")
         tk.Label(hdr, text="Cookie Randomizer", font=("Segoe UI", 11, "bold"),
                  bg=C["panel"], fg=C["text"], pady=7).pack(side="left", padx=14)
-        tk.Label(hdr, text="generate random cookies for multi-browser / anti-detect profiles",
+        tk.Label(hdr, text="builds a realistic multi-site browsing history for Multilogin / AdsPower profiles",
                  font=("Segoe UI", 9), bg=C["panel"], fg=C["hint"]).pack(side="left")
 
         body = tk.Frame(tab, bg=C["bg"])
         body.pack(fill="both", expand=True, padx=14, pady=10)
 
-        # ── Row 1: domain + count ──
+        # ── Info banner ──
+        info = tk.Frame(body, bg=C["panel"])
+        info.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            info,
+            text=(
+                "  Only client-side analytics cookies (_ga, _gid, _fbp, _hjid) — the ones tracking scripts "
+                "actually read.\n  Timestamps are spread over the chosen age so the profile looks genuinely used, not brand-new."
+            ),
+            bg=C["panel"], fg=C["dim"], font=("Segoe UI", 8), justify="left",
+        ).pack(anchor="w", padx=8, pady=6)
+
+        # ── Row 1: profile age + site count ──
         row1 = tk.Frame(body, bg=C["bg"])
-        row1.pack(fill="x", pady=(0, 6))
+        row1.pack(fill="x", pady=(0, 8))
 
-        tk.Label(row1, text="Domain:", bg=C["bg"], fg=C["dim"],
+        tk.Label(row1, text="Profile age:", bg=C["bg"], fg=C["dim"],
                  font=("Segoe UI", 9)).pack(side="left")
-        self._ck_domain = tk.Entry(row1, width=24, bg=C["panel"], fg=C["text"],
-                                   insertbackground=C["text"], relief="flat",
-                                   font=("Segoe UI", 10))
-        self._ck_domain.insert(0, "example.com")
-        self._ck_domain.pack(side="left", padx=(4, 18), ipady=4)
+        self._ck_age = ttk.Combobox(
+            row1,
+            values=["7 days", "30 days", "90 days", "180 days", "1 year"],
+            width=10, font=("Segoe UI", 10), state="readonly",
+        )
+        self._ck_age.set("90 days")
+        self._ck_age.pack(side="left", padx=(4, 24))
 
-        tk.Label(row1, text="Count:", bg=C["bg"], fg=C["dim"],
+        tk.Label(row1, text="Sites:", bg=C["bg"], fg=C["dim"],
                  font=("Segoe UI", 9)).pack(side="left")
-        self._ck_count = ttk.Combobox(row1, values=["5","10","15","20","30","50"],
-                                      width=5, font=("Segoe UI", 10), state="readonly")
-        self._ck_count.set("10")
-        self._ck_count.pack(side="left", padx=4)
+        self._ck_sites = ttk.Combobox(
+            row1,
+            values=["10", "15", "20", "25"],
+            width=5, font=("Segoe UI", 10), state="readonly",
+        )
+        self._ck_sites.set("20")
+        self._ck_sites.pack(side="left", padx=(4, 0))
+        tk.Label(row1, text="popular sites", bg=C["bg"], fg=C["hint"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=4)
 
-        # ── Row 2: category checkboxes ──
+        # ── Row 2: action buttons ──
         row2 = tk.Frame(body, bg=C["bg"])
         row2.pack(fill="x", pady=(0, 8))
 
-        tk.Label(row2, text="Categories:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left")
-
-        self._ck_cats = {}
-        cat_defs = [
-            ("analytics", "Analytics (_ga, _fbp…)"),
-            ("session",   "Session (PHPSESSID…)"),
-            ("auth",      "Auth (tokens, CSRF…)"),
-            ("tracking",  "Tracking (Cloudflare…)"),
-            ("prefs",     "Preferences"),
-        ]
-        for key, label in cat_defs:
-            var = tk.BooleanVar(value=True)
-            self._ck_cats[key] = var
-            tk.Checkbutton(row2, text=label, variable=var,
-                           bg=C["bg"], fg=C["text"], selectcolor=C["panel"],
-                           activebackground=C["bg"], activeforeground=C["blue"],
-                           font=("Segoe UI", 9), cursor="hand2").pack(side="left", padx=5)
-
-        # ── Row 3: action buttons ──
-        row3 = tk.Frame(body, bg=C["bg"])
-        row3.pack(fill="x", pady=(0, 8))
-
-        tk.Button(row3, text="⚄  Generate", command=self._generate_cookies,
+        tk.Button(row2, text="⚄  Generate Profile", command=self._generate_cookies,
                   bg=C["blue"], fg="#1e1e2e", relief="flat", cursor="hand2",
                   font=("Segoe UI", 10, "bold"), padx=16, pady=6).pack(side="left", padx=(0, 6))
 
-        tk.Button(row3, text="Copy JSON", command=self._copy_cookies,
+        tk.Button(row2, text="Copy JSON", command=self._copy_cookies,
                   bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
                   font=("Segoe UI", 10), padx=12, pady=6).pack(side="left", padx=4)
 
-        tk.Button(row3, text="Save to File…", command=self._save_cookies,
+        tk.Button(row2, text="Save to File…", command=self._save_cookies,
                   bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
                   font=("Segoe UI", 10), padx=12, pady=6).pack(side="left", padx=4)
 
-        tk.Button(row3, text="Clear", command=self._clear_cookies,
+        tk.Button(row2, text="Clear", command=self._clear_cookies,
                   bg=C["muted"], fg=C["red"], relief="flat", cursor="hand2",
                   font=("Segoe UI", 10), padx=12, pady=6).pack(side="left", padx=4)
 
         self._ck_status = tk.StringVar(value="")
-        tk.Label(row3, textvariable=self._ck_status, bg=C["bg"], fg=C["green"],
+        tk.Label(row2, textvariable=self._ck_status, bg=C["bg"], fg=C["green"],
                  font=("Segoe UI", 9, "italic")).pack(side="left", padx=10)
 
         # ── JSON output area ──
-        tk.Label(body, text="JSON output  (compatible with Selenium, Playwright, GoLogin, AdsPower, Puppeteer)",
-                 bg=C["bg"], fg=C["dim"], font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(2, 2))
+        tk.Label(
+            body,
+            text="JSON output  —  paste directly into Multilogin / AdsPower / GoLogin cookie import field",
+            bg=C["bg"], fg=C["dim"], font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w", pady=(2, 2))
 
         self._ck_output = scrolledtext.ScrolledText(
             body, bg="#181825", fg=C["text"], font=("Consolas", 9),
@@ -575,27 +628,27 @@ class App:
         )
         self._ck_output.pack(fill="both", expand=True)
 
+    # ── Cookie tab actions ────────────────────────────────────────────────────
+
+    _AGE_MAP = {"7 days": 7, "30 days": 30, "90 days": 90, "180 days": 180, "1 year": 365}
+
     def _generate_cookies(self):
-        domain = self._ck_domain.get().strip()
+        age_label = self._ck_age.get()
+        age_days  = self._AGE_MAP.get(age_label, 90)
         try:
-            count = int(self._ck_count.get())
+            site_count = int(self._ck_sites.get())
         except ValueError:
-            count = 10
+            site_count = 20
 
-        selected = [k for k, v in self._ck_cats.items() if v.get()]
-        if not selected:
-            self._ck_status.set("Select at least one category.")
-            return
-
-        cookies = self._cookie_gen.generate(domain, count, selected)
+        cookies = self._cookie_gen.generate_profile(age_days, site_count)
         output  = json.dumps(cookies, indent=2)
 
         self._ck_output.config(state="normal")
         self._ck_output.delete("1.0", "end")
         self._ck_output.insert("end", output)
-        self._ck_output.config(state="normal")
 
-        self._ck_status.set(f"Generated {len(cookies)} cookies.")
+        domains = len({c["domain"] for c in cookies})
+        self._ck_status.set(f"{len(cookies)} cookies across {domains} domains  |  profile age: {age_label}")
 
     def _copy_cookies(self):
         text = self._ck_output.get("1.0", "end").strip()
@@ -611,10 +664,9 @@ class App:
         if not text:
             self._ck_status.set("Nothing to save — generate first.")
             return
-        domain = self._ck_domain.get().strip().replace(".", "_") or "cookies"
         path = filedialog.asksaveasfilename(
             defaultextension=".json",
-            initialfile=f"{domain}_cookies.json",
+            initialfile="profile_cookies.json",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
         if path:

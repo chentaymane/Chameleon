@@ -794,10 +794,14 @@ class App:
 
         div()
 
-        h("First thing to try: appeal the ban", C["yellow"])
-        p("Email:  legal@teepublic.com")
-        p("Many wrongly-banned accounts are reinstated quickly.")
-        p("State clearly that you were not spamming and ask which rule was violated.")
+        h("If an account gets banned", C["yellow"])
+        p("Before creating a new account, always try appealing first.")
+        p("  Find the platform's support email or help centre → submit an appeal.", indent=True)
+        p("  State clearly what happened and ask which rule was violated.", indent=True)
+        p("  Many wrongly-flagged accounts are reinstated quickly.", indent=True)
+        p("")
+        p("If the ban is final, make sure every layer above is clean before the next attempt.")
+        p("  A new IP alone is not enough — fingerprint, cookies, email and payment must all be fresh.", indent=True)
 
         tk.Frame(inner, bg=C["bg"], height=20).pack()
 

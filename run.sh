@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Anti-Detect Suite launcher for Linux / macOS
+# Chameleon launcher for Linux / macOS
 set -e
 
-echo "Anti-Detect Suite"
-echo "-----------------"
+echo "Chameleon - smart IP rotation"
+echo "-----------------------------"
 
 # Pick a Python 3 interpreter
 if command -v python3 >/dev/null 2>&1; then
@@ -28,5 +28,5 @@ echo "Installing dependencies..."
     echo "pip install failed (continuing — deps may already be present)."
 
 echo
-echo "Launching app..."
-exec "$PY" ip_changer.py
+echo "Launching Chameleon..."
+exec "$PY" chameleon.py

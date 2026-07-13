@@ -1,24 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-Anti-Detect Suite — cross-platform smart IP rotation.
+Chameleon — cross-platform smart IP rotation.
 
-Key behaviour:
-  - Background threads fetch & test proxies continuously from public sources
-    (HTTP / SOCKS4 / SOCKS5) plus any custom list you load.
-  - The queue ALWAYS holds tested, working proxies, each tagged with its
-    country and measured latency.
-  - When the timer fires: if a proxy matching your filters is ready → rotate
-    instantly. If not → show "waiting…" and hold until one is verified.
-  - Manual mode: pick the country for the *next* proxy, then click Next Proxy.
-  - Optional health check re-tests the active proxy and auto-rotates if it dies.
+Blend into a new location on demand: fetch, test and geo-tag free/paid proxies
+(HTTP · SOCKS4 · SOCKS5), then rotate the OS system proxy on a timer or manually,
+optionally pinned to a chosen country.
+
+Highlights
+  - Background workers keep a queue of verified, latency-measured proxies ready.
+  - Every proxy is geo-tagged; pick the country for the next rotation.
+  - Load your own paid proxy list (host:port:user:pass supported).
+  - Optional health check re-tests the active proxy and auto-rotates on failure.
+  - Live session stats: queue depth, proxies verified, rotations, per-country mix.
   - On stop / close: the system proxy is restored to a direct connection.
 
-Platforms:
-  - Windows : WinINET system proxy (Chrome, Edge, IE, and WinINET apps).
-  - Linux   : GNOME gsettings proxy (GNOME/Cinnamon/Unity apps that follow it).
+Platforms
+  - Windows : WinINET system proxy (Chrome, Edge, IE, WinINET apps).
+  - Linux   : GNOME gsettings proxy (apps that follow it).
   - macOS   : networksetup on active network services.
-On any platform you can also just copy the active proxy string and paste it
-into an anti-detect browser (Multilogin / AdsPower / GoLogin) profile.
+On any platform you can also copy the active proxy string into an anti-detect
+browser profile (Multilogin / AdsPower / GoLogin).
 """
 
 import tkinter as tk
@@ -61,7 +62,7 @@ PROXY_SOURCES = [
     ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt", "socks5"),
 ]
 
-# Step-1 test: proxy's own IP + geolocation (returns country fields we need).
+# Step-1 test: proxy's own IP + geolocation (returns the country fields we need).
 GEO_TEST_URL       = "http://ip-api.com/json/?fields=status,country,countryCode,query"
 # Step-2 test: prove the proxy reaches a real site, not just whitelisted APIs.
 SECONDARY_TEST_URL = "http://example.com"
@@ -82,12 +83,18 @@ IP_CHECK_ENDPOINTS = [
     ("http://ipecho.net/plain",                                   lambda r: r.text.strip()),
 ]
 
-# ── Colour palette ────────────────────────────────────────────────────────────
+# ── Colour palette & fonts ─────────────────────────────────────────────────────
 
 C = dict(
-    bg="#1e1e2e", panel="#313244", muted="#45475a", text="#cdd6f4",
-    dim="#a6adc8", hint="#6c7086", blue="#89b4fa", red="#f38ba8",
-    green="#a6e3a1", yellow="#f9e2af", orange="#fab387", mauve="#cba6f7",
+    bg="#181825", surface="#1e1e2e", panel="#313244", muted="#45475a",
+    text="#cdd6f4", dim="#a6adc8", hint="#6c7086", blue="#89b4fa",
+    red="#f38ba8", green="#a6e3a1", yellow="#f9e2af", orange="#fab387",
+    mauve="#cba6f7", teal="#94e2d5",
+)
+F = dict(
+    h1=("Segoe UI Semibold", 15), h2=("Segoe UI Semibold", 10),
+    body=("Segoe UI", 9), small=("Segoe UI", 8), mono=("Consolas", 9),
+    stat=("Segoe UI Semibold", 14), btn=("Segoe UI Semibold", 10),
 )
 
 
@@ -98,7 +105,7 @@ class Proxy:
     __slots__ = ("addr", "protocol", "cc", "country", "latency")
 
     def __init__(self, addr, protocol, cc, country, latency):
-        self.addr     = addr        # "host:port"
+        self.addr     = addr        # "host:port" (may include user:pass@)
         self.protocol = protocol    # http | socks4 | socks5
         self.cc       = cc or "??"  # ISO country code, e.g. "US"
         self.country  = country or "Unknown"
@@ -110,7 +117,7 @@ class Proxy:
         return {"http": url, "https": url}
 
     def __str__(self):
-        return f"{self.addr} [{self.protocol}] {self.cc} {self.latency}ms"
+        return f"{self.addr}  ·  {self.protocol}  ·  {self.cc}  ·  {self.latency} ms"
 
 
 # ── System proxy control (cross-platform) ─────────────────────────────────────
@@ -235,18 +242,22 @@ class ProxyManager:
 
     def __init__(self, on_log, on_change):
         self._log       = on_log
-        self._change    = on_change              # called with () after pool changes
+        self._change    = on_change
         self._pool: deque[Proxy] = deque()
         self._lock      = threading.Lock()
         self._seen      = set()
         self._seen_lock = threading.Lock()
         self._sem       = threading.Semaphore(TEST_WORKERS)
         self._active    = False
-        self._custom: list[tuple[str, str]] = []   # (addr, protocol) user-provided
+        self._custom: list[tuple[str, str]] = []
 
         # Live filters (set from the UI thread; read by workers).
         self.protocol_filter = "all"   # all | http | socks4 | socks5
         self.max_latency     = 0       # ms; 0 = no cap
+
+        # Session counters.
+        self.verified_total = 0        # proxies that ever passed testing
+        self.tested_total   = 0        # proxies that were attempted
 
     # ── Introspection ──
     @property
@@ -257,6 +268,10 @@ class ProxyManager:
     def countries(self) -> Counter:
         with self._lock:
             return Counter(p.cc for p in self._pool)
+
+    def snapshot(self):
+        with self._lock:
+            return list(self._pool)
 
     # ── Lifecycle ──
     def start(self):
@@ -269,7 +284,6 @@ class ProxyManager:
         self._active = False
 
     def add_custom(self, entries):
-        """entries: list of (addr, protocol). Retried every cycle until working."""
         added = 0
         with self._lock:
             existing = {a for a, _ in self._custom}
@@ -281,7 +295,6 @@ class ProxyManager:
         return added
 
     def get_next(self, cc=None) -> Proxy | None:
-        """Pop the next proxy, optionally the first one matching a country code."""
         with self._lock:
             if not self._pool:
                 return None
@@ -308,9 +321,9 @@ class ProxyManager:
 
     def _fetch_batch(self):
         raw: list[tuple[str, str]] = []
+        pf = self.protocol_filter
 
         # Custom proxies first — the user paid for these; keep retrying them.
-        pf = self.protocol_filter
         for addr, proto in list(self._custom):
             if pf == "all" or pf == proto:
                 raw.append((addr, proto))
@@ -344,10 +357,10 @@ class ProxyManager:
         with self._sem:
             if self.ready >= QUEUE_HIGH_MARK:
                 return
+            self.tested_total += 1
             proxy = Proxy(addr, proto, None, None, 0)
             p = proxy.requests_dict()
             try:
-                # Step 1: geolocation + latency.
                 t0 = time.time()
                 r = requests.get(GEO_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
                 latency = int((time.time() - t0) * 1000)
@@ -359,15 +372,11 @@ class ProxyManager:
                 ip = data.get("query", "")
                 if not ip or "." not in ip:
                     return
-
                 if self.max_latency and latency > self.max_latency:
                     return
-
-                # Step 2: reach a real website, not just the IP-lookup API.
                 r2 = requests.get(SECONDARY_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
                 if r2.status_code not in (200, 301, 302):
                     return
-
                 proxy.cc      = data.get("countryCode") or "??"
                 proxy.country = data.get("country") or "Unknown"
                 proxy.latency = latency
@@ -381,7 +390,8 @@ class ProxyManager:
             with self._lock:
                 self._pool.append(proxy)
                 n = len(self._pool)
-            self._log(f"✓  {addr}  [{proto}]  {proxy.cc} {ip}  {latency}ms   (queue: {n})")
+            self.verified_total += 1
+            self._log(f"✓  {addr}  [{proto}]  {proxy.cc} {ip}  {latency} ms   (queue: {n})")
             self._change()
 
 
@@ -389,16 +399,15 @@ class ProxyManager:
 
 def parse_proxy_line(line, default_proto="http"):
     """
-    Accepts several common formats and returns (addr, protocol) or None:
+    Accepts common formats and returns (addr, protocol) or None:
       host:port
       protocol://host:port
-      host:port:user:pass          (auth folded into addr for requests)
+      host:port:user:pass
       protocol://user:pass@host:port
     """
     line = line.strip()
     if not line or line.startswith("#"):
         return None
-
     proto = default_proto
     if "://" in line:
         proto, line = line.split("://", 1)
@@ -407,14 +416,12 @@ def parse_proxy_line(line, default_proto="http"):
             proto = default_proto
         if proto == "https":
             proto = "http"
-
-    if "@" in line:                        # user:pass@host:port
+    if "@" in line:
         return (line, proto)
-
     parts = line.split(":")
     if len(parts) == 2:
         return (line, proto)
-    if len(parts) == 4:                    # host:port:user:pass
+    if len(parts) == 4:
         host, port, user, pw = parts
         return (f"{user}:{pw}@{host}:{port}", proto)
     return None
@@ -423,259 +430,213 @@ def parse_proxy_line(line, default_proto="http"):
 # ── GUI ───────────────────────────────────────────────────────────────────────
 
 class App:
+    APP_NAME = "Chameleon"
+
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Anti-Detect Suite")
-        self.root.geometry("760x680")
-        self.root.minsize(720, 620)
+        self.root.title(self.APP_NAME)
+        self.root.geometry("760x720")
+        self.root.minsize(700, 660)
         self.root.configure(bg=C["bg"])
 
-        self._running       = False
+        self._running = False
         self._current: Proxy | None = None
-        self._rotation_thread: threading.Thread | None = None
+        self._rotations = 0
+        self._sel_country_code = "Any"
 
         self._manager = ProxyManager(
             on_log    = lambda msg: self.root.after(0, self._log, msg),
             on_change = lambda: self.root.after(0, self._refresh_status),
         )
 
-        self._build_ui()
         self._apply_style()
-        self.root.after(1500, self._tick_status)   # periodic country/queue refresh
+        self._build_ui()
+        self.root.after(1200, self._tick_status)
+
+    # ── Small UI helpers ──────────────────────────────────────────────────────
+    def _card(self, parent, title=None):
+        """A rounded-looking surface panel with optional header."""
+        outer = tk.Frame(parent, bg=C["surface"], highlightthickness=1,
+                         highlightbackground=C["panel"])
+        outer.pack(fill="x", pady=6)
+        if title:
+            tk.Label(outer, text=title.upper(), bg=C["surface"], fg=C["hint"],
+                     font=F["small"]).pack(anchor="w", padx=14, pady=(10, 0))
+        body = tk.Frame(outer, bg=C["surface"])
+        body.pack(fill="x", padx=14, pady=(6, 12))
+        return body
+
+    def _btn(self, parent, text, cmd, kind="ghost", **kw):
+        styles = {
+            "primary": dict(bg=C["blue"], fg="#11111b"),
+            "danger":  dict(bg=C["red"],  fg="#11111b"),
+            "ghost":   dict(bg=C["panel"], fg=C["text"]),
+        }
+        opts = dict(relief="flat", cursor="hand2", bd=0,
+                    activebackground=C["muted"], activeforeground=C["text"],
+                    font=F["btn"], padx=14, pady=7)
+        opts.update(styles[kind])
+        opts.update(kw)                       # caller overrides win
+        return tk.Button(parent, text=text, command=cmd, **opts)
+
+    def _combo(self, parent, var, values, width, on_change=None):
+        cb = ttk.Combobox(parent, textvariable=var, values=values, width=width,
+                          font=F["body"], state="readonly")
+        if on_change:
+            cb.bind("<<ComboboxSelected>>", on_change)
+        return cb
 
     # ── UI skeleton ───────────────────────────────────────────────────────────
     def _build_ui(self):
+        # Header
         bar = tk.Frame(self.root, bg=C["panel"])
         bar.pack(fill="x")
-        tk.Label(bar, text="Anti-Detect Suite", font=("Segoe UI", 13, "bold"),
-                 bg=C["panel"], fg=C["text"], pady=8).pack(side="left", padx=16)
-        tk.Label(bar, text=f"smart IP rotation · {_SYS}",
-                 font=("Segoe UI", 9), bg=C["panel"], fg=C["hint"]).pack(side="left")
+        tk.Label(bar, text="🦎  " + self.APP_NAME, font=F["h1"],
+                 bg=C["panel"], fg=C["text"], pady=10).pack(side="left", padx=16)
+        tk.Label(bar, text=f"smart IP rotation  ·  {_SYS}", font=F["body"],
+                 bg=C["panel"], fg=C["hint"]).pack(side="left")
 
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, padx=16, pady=12)
-        self._build_rotator_tab(nb)
-        self._build_guide_tab(nb)
+        root = tk.Frame(self.root, bg=C["bg"])
+        root.pack(fill="both", expand=True, padx=16, pady=(10, 12))
 
-    # ── Rotator tab ───────────────────────────────────────────────────────────
-    def _build_rotator_tab(self, nb):
-        tab = tk.Frame(nb, bg=C["bg"])
-        nb.add(tab, text="  IP Rotator  ")
+        self._build_ip_card(root)
+        self._build_stats_card(root)
+        self._build_controls_card(root)
+        self._build_action_row(root)
+        self._build_log(root)
 
-        # Current IP card
-        ip_card = tk.Frame(tab, bg=C["panel"])
-        ip_card.pack(fill="x", pady=(8, 4))
-        tk.Label(ip_card, text="Current IP", bg=C["panel"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=14, pady=10)
+    # ── Current-IP card ─────────────────────────────────────────────────────
+    def _build_ip_card(self, parent):
+        body = self._card(parent, "Current connection")
+        top = tk.Frame(body, bg=C["surface"])
+        top.pack(fill="x")
+
+        self._dot = tk.Label(top, text="●", bg=C["surface"], fg=C["hint"], font=("Segoe UI", 13))
+        self._dot.pack(side="left")
         self._ip_var = tk.StringVar(value="fetching…")
-        tk.Label(ip_card, textvariable=self._ip_var, bg=C["panel"], fg=C["blue"],
-                 font=("Segoe UI", 13, "bold")).pack(side="left", padx=6)
-        self._dot = tk.Label(ip_card, text="●", bg=C["panel"], fg=C["hint"],
-                             font=("Segoe UI", 11))
-        self._dot.pack(side="left", padx=3)
-        tk.Button(ip_card, text="Refresh", command=self._refresh_ip_async,
-                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-                  font=("Segoe UI", 9), padx=9, pady=4).pack(side="right", padx=12)
+        tk.Label(top, textvariable=self._ip_var, bg=C["surface"], fg=C["blue"],
+                 font=F["stat"]).pack(side="left", padx=8)
+        self._btn(top, "Refresh", self._refresh_ip_async, "ghost",
+                  padx=10, pady=4, font=F["body"]).pack(side="right")
 
-        # Active proxy + queue status
-        st = tk.Frame(tab, bg=C["bg"])
-        st.pack(fill="x", pady=(4, 0))
-        tk.Label(st, text="Active proxy:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
-        self._active_var = tk.StringVar(value="none")
-        tk.Label(st, textvariable=self._active_var, bg=C["bg"], fg=C["green"],
-                 font=("Consolas", 9)).grid(row=0, column=1, sticky="w", padx=6)
-        tk.Button(st, text="Copy", command=self._copy_active,
-                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-                  font=("Segoe UI", 8), padx=6).grid(row=0, column=2, padx=4)
+        self._active_var = tk.StringVar(value="Proxy: none  ·  direct connection")
+        row = tk.Frame(body, bg=C["surface"])
+        row.pack(fill="x", pady=(8, 0))
+        tk.Label(row, textvariable=self._active_var, bg=C["surface"], fg=C["dim"],
+                 font=F["mono"]).pack(side="left")
+        self._btn(row, "Copy", self._copy_active, "ghost",
+                  padx=8, pady=2, font=F["small"]).pack(side="right")
 
-        tk.Label(st, text="Queue:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=(3, 0))
-        self._queue_var = tk.StringVar(value="idle")
-        tk.Label(st, textvariable=self._queue_var, bg=C["bg"], fg=C["yellow"],
-                 font=("Segoe UI", 9, "bold")).grid(row=1, column=1, sticky="w",
-                                                    padx=6, pady=(3, 0))
-        self._wait_var = tk.StringVar(value="")
-        tk.Label(st, textvariable=self._wait_var, bg=C["bg"], fg=C["orange"],
-                 font=("Segoe UI", 9, "italic")).grid(row=1, column=3, sticky="w",
-                                                      pady=(3, 0))
+    # ── Stats card ────────────────────────────────────────────────────────────
+    def _build_stats_card(self, parent):
+        body = self._card(parent, "Session")
+        grid = tk.Frame(body, bg=C["surface"])
+        grid.pack(fill="x")
 
-        # Options row 1: interval / latency / protocol
-        opt1 = tk.Frame(tab, bg=C["bg"])
-        opt1.pack(fill="x", pady=(10, 2))
-        tk.Label(opt1, text="Rotate every:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left")
+        self._stat_queue = self._stat_cell(grid, 0, "Queue ready", C["yellow"])
+        self._stat_verif = self._stat_cell(grid, 1, "Verified", C["green"])
+        self._stat_rot   = self._stat_cell(grid, 2, "Rotations", C["mauve"])
+        self._stat_tested= self._stat_cell(grid, 3, "Tested", C["teal"])
+        for i in range(4):
+            grid.columnconfigure(i, weight=1)
+
+        self._countries_var = tk.StringVar(value="No countries discovered yet")
+        tk.Label(body, textvariable=self._countries_var, bg=C["surface"], fg=C["dim"],
+                 font=F["small"], anchor="w").pack(fill="x", pady=(10, 0))
+
+    def _stat_cell(self, parent, col, label, color):
+        cell = tk.Frame(parent, bg=C["surface"])
+        cell.grid(row=0, column=col, sticky="ew")
+        var = tk.StringVar(value="0")
+        tk.Label(cell, textvariable=var, bg=C["surface"], fg=color,
+                 font=F["stat"]).pack()
+        tk.Label(cell, text=label, bg=C["surface"], fg=C["hint"],
+                 font=F["small"]).pack()
+        return var
+
+    # ── Controls card ─────────────────────────────────────────────────────────
+    def _build_controls_card(self, parent):
+        body = self._card(parent, "Rotation settings")
+
+        r1 = tk.Frame(body, bg=C["surface"])
+        r1.pack(fill="x", pady=(0, 8))
+        tk.Label(r1, text="Rotate every", bg=C["surface"], fg=C["dim"],
+                 font=F["body"]).pack(side="left")
         self._interval_var = tk.StringVar(value="30")
-        self._interval_cb = ttk.Combobox(
-            opt1, textvariable=self._interval_var,
-            values=["Manual", "15", "30", "45", "60", "90", "120", "300"],
-            width=7, font=("Segoe UI", 9), state="readonly")
-        self._interval_cb.pack(side="left", padx=6)
-        tk.Label(opt1, text="s", bg=C["bg"], fg=C["hint"],
-                 font=("Segoe UI", 9)).pack(side="left")
+        self._interval_cb = self._combo(r1, self._interval_var,
+            ["Manual", "15", "30", "45", "60", "90", "120", "300"], 8)
+        self._interval_cb.pack(side="left", padx=(6, 2))
+        tk.Label(r1, text="sec", bg=C["surface"], fg=C["hint"],
+                 font=F["small"]).pack(side="left")
 
-        tk.Label(opt1, text="Max latency:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=(18, 0))
-        self._lat_var = tk.StringVar(value="Any")
-        lat_cb = ttk.Combobox(opt1, textvariable=self._lat_var,
-                              values=["Any", "1000", "2000", "3000", "5000"],
-                              width=6, font=("Segoe UI", 9), state="readonly")
-        lat_cb.pack(side="left", padx=6)
-        lat_cb.bind("<<ComboboxSelected>>", self._on_filters_change)
-
-        tk.Label(opt1, text="Protocol:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=(18, 0))
+        tk.Label(r1, text="Protocol", bg=C["surface"], fg=C["dim"],
+                 font=F["body"]).pack(side="left", padx=(18, 0))
         self._proto_var = tk.StringVar(value="all")
-        proto_cb = ttk.Combobox(opt1, textvariable=self._proto_var,
-                                values=["all", "http", "socks4", "socks5"],
-                                width=7, font=("Segoe UI", 9), state="readonly")
-        proto_cb.pack(side="left", padx=6)
-        proto_cb.bind("<<ComboboxSelected>>", self._on_filters_change)
+        self._combo(r1, self._proto_var, ["all", "http", "socks4", "socks5"], 7,
+                    self._on_filters_change).pack(side="left", padx=6)
 
-        # Options row 2: country + health check
-        opt2 = tk.Frame(tab, bg=C["bg"])
-        opt2.pack(fill="x", pady=(2, 2))
-        tk.Label(opt2, text="Country for next proxy:", bg=C["bg"], fg=C["mauve"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Label(r1, text="Max latency", bg=C["surface"], fg=C["dim"],
+                 font=F["body"]).pack(side="left", padx=(18, 0))
+        self._lat_var = tk.StringVar(value="Any")
+        self._combo(r1, self._lat_var, ["Any", "1000", "2000", "3000", "5000"], 7,
+                    self._on_filters_change).pack(side="left", padx=6)
+        tk.Label(r1, text="ms", bg=C["surface"], fg=C["hint"],
+                 font=F["small"]).pack(side="left")
+
+        r2 = tk.Frame(body, bg=C["surface"])
+        r2.pack(fill="x")
+        tk.Label(r2, text="Country for next proxy", bg=C["surface"], fg=C["mauve"],
+                 font=F["h2"]).pack(side="left")
         self._country_var = tk.StringVar(value="Any")
-        self._country_cb = ttk.Combobox(opt2, textvariable=self._country_var,
-                                        values=["Any"], width=22,
-                                        font=("Segoe UI", 9), state="readonly")
-        self._country_cb.pack(side="left", padx=6)
-        self._country_cb.bind("<<ComboboxSelected>>",
-                              lambda _e: self._selected_country())
+        self._country_cb = self._combo(r2, self._country_var, ["Any"], 26,
+                                       lambda _e: self._selected_country())
+        self._country_cb.pack(side="left", padx=8)
 
         self._health_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(opt2, text="Auto-recheck active proxy", variable=self._health_var,
-                       bg=C["bg"], fg=C["dim"], selectcolor=C["panel"],
-                       activebackground=C["bg"], activeforeground=C["text"],
-                       font=("Segoe UI", 9)).pack(side="left", padx=(18, 0))
+        tk.Checkbutton(r2, text="Auto-recheck active proxy", variable=self._health_var,
+                       bg=C["surface"], fg=C["dim"], selectcolor=C["panel"],
+                       activebackground=C["surface"], activeforeground=C["text"],
+                       font=F["body"], bd=0, highlightthickness=0).pack(side="right")
 
-        # Buttons
-        btn = tk.Frame(tab, bg=C["bg"])
-        btn.pack(pady=8)
-        self._start_btn = tk.Button(btn, text="▶  Start Rotation", command=self._toggle,
-                                    bg=C["blue"], fg="#1e1e2e", relief="flat", cursor="hand2",
-                                    font=("Segoe UI", 10, "bold"), padx=16, pady=7)
-        self._start_btn.pack(side="left", padx=4)
-        self._next_btn = tk.Button(btn, text="→ Next Proxy", command=self._force_rotate,
-                                   bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-                                   font=("Segoe UI", 10), padx=12, pady=7, state="disabled")
-        self._next_btn.pack(side="left", padx=4)
-        tk.Button(btn, text="Disable Proxy", command=self._disable_proxy_and_refresh,
-                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-                  font=("Segoe UI", 10), padx=12, pady=7).pack(side="left", padx=4)
-        tk.Button(btn, text="Load list…", command=self._load_custom,
-                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-                  font=("Segoe UI", 10), padx=12, pady=7).pack(side="left", padx=4)
-        tk.Button(btn, text="Export working", command=self._export_working,
-                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-                  font=("Segoe UI", 10), padx=12, pady=7).pack(side="left", padx=4)
+    # ── Action row + countdown ────────────────────────────────────────────────
+    def _build_action_row(self, parent):
+        wrap = tk.Frame(parent, bg=C["bg"])
+        wrap.pack(fill="x", pady=(2, 0))
 
-        # Countdown / progress
-        cd = tk.Frame(tab, bg=C["bg"])
-        cd.pack(fill="x", pady=(4, 2))
+        self._start_btn = self._btn(wrap, "▶  Start", self._toggle, "primary")
+        self._start_btn.pack(side="left", padx=(0, 6))
+        self._next_btn = self._btn(wrap, "→ Next Proxy", self._force_rotate, "ghost",
+                                   state="disabled")
+        self._next_btn.pack(side="left", padx=6)
+        self._btn(wrap, "Disable", self._disable_proxy_and_refresh, "ghost").pack(side="left", padx=6)
+        self._btn(wrap, "Export", self._export_working, "ghost",
+                  padx=10, font=F["body"]).pack(side="right")
+        self._btn(wrap, "Load list…", self._load_custom, "ghost",
+                  padx=10, font=F["body"]).pack(side="right", padx=6)
+
+        cd = tk.Frame(parent, bg=C["bg"])
+        cd.pack(fill="x", pady=(10, 0))
         self._cd_var = tk.StringVar(value="")
         tk.Label(cd, textvariable=self._cd_var, bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(anchor="w")
+                 font=F["small"]).pack(anchor="w")
         self._progress = ttk.Progressbar(cd, mode="determinate")
-        self._progress.pack(fill="x", pady=2)
+        self._progress.pack(fill="x", pady=(2, 0))
+        self._wait_var = tk.StringVar(value="")
+        tk.Label(cd, textvariable=self._wait_var, bg=C["bg"], fg=C["orange"],
+                 font=F["small"]).pack(anchor="w")
 
-        # Log
-        tk.Label(tab, text="Activity log", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 1))
+    # ── Log ─────────────────────────────────────────────────────────────────
+    def _build_log(self, parent):
+        hdr = tk.Frame(parent, bg=C["bg"])
+        hdr.pack(fill="x", pady=(8, 2))
+        tk.Label(hdr, text="ACTIVITY LOG", bg=C["bg"], fg=C["hint"],
+                 font=F["small"]).pack(side="left")
+        self._btn(hdr, "Clear", self._clear_log, "ghost",
+                  padx=8, pady=1, font=F["small"]).pack(side="right")
         self._log_widget = scrolledtext.ScrolledText(
-            tab, height=10, bg="#181825", fg=C["text"], font=("Consolas", 9),
+            parent, height=9, bg="#11111b", fg=C["text"], font=F["mono"],
             relief="flat", bd=0, insertbackground=C["text"], state="disabled")
         self._log_widget.pack(fill="both", expand=True)
-
-    # ── Guide tab ─────────────────────────────────────────────────────────────
-    def _build_guide_tab(self, nb):
-        tab = tk.Frame(nb, bg=C["bg"])
-        nb.add(tab, text="  Anti-Detect Guide  ")
-
-        canvas = tk.Canvas(tab, bg=C["bg"], highlightthickness=0)
-        sb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg=C["bg"])
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        canvas.bind_all("<MouseWheel>",
-                        lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
-        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
-        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
-
-        def h(text, color=C["blue"]):
-            tk.Label(inner, text=text, bg=C["bg"], fg=color,
-                     font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=14, pady=(14, 3))
-
-        def p(text, indent=False):
-            tk.Label(inner, text=text, bg=C["bg"],
-                     fg=C["dim"] if indent else C["text"], font=("Segoe UI", 9),
-                     justify="left", wraplength=630).pack(anchor="w",
-                     padx=28 if indent else 14, pady=1)
-
-        def div():
-            tk.Frame(inner, bg=C["muted"], height=1).pack(fill="x", padx=14, pady=8)
-
-        h("How websites detect returning users", C["yellow"])
-        p("① IP address           — changes with a proxy or VPN (this app handles this)")
-        p("② Browser fingerprint  — Canvas, WebGL GPU hash, fonts, screen, timezone,")
-        p("                          plugins, CPU cores, memory → unique device hash", indent=True)
-        p("③ Cookies & storage    — session tokens saved across visits")
-        p("④ Behavioural signals  — mouse movement, typing speed, scroll patterns")
-        p("⑤ Email + payment      — permanently linked to your identity")
-        div()
-
-        h("Layer 1 — IP rotation  (this app)", C["green"])
-        p(f"✔  Runs on {_SYS}: {SystemProxy.platform_note()}")
-        p("✔  HTTP + SOCKS4 + SOCKS5 sources, tested with concurrent workers.")
-        p("✔  Each proxy is geo-tagged — pick the country for the next rotation.")
-        p("✔  Load your own paid proxy list (host:port:user:pass supported).")
-        p("✔  Optional health check auto-rotates when the active proxy dies.")
-        p("✔  On Stop / close: proxy disabled, direct connection restored.")
-        p("⚠  Firefox uses its own proxy setting — or paste the proxy into your", indent=True)
-        p("   anti-detect browser profile directly (Copy button).", indent=True)
-        div()
-
-        h("Layer 2 — Browser fingerprint  (do this manually!)", C["red"])
-        p("Changing IP alone is not enough. This is what catches most people.")
-        p("Option A — GoLogin (gologin.com, 3 free profiles): spoofs Canvas, WebGL, fonts, UA")
-        p("Option B — AdsPower (adspower.com, 2 free profiles): 50+ spoofable parameters")
-        p("Option C — Brave: Settings → Privacy → 'Randomize fingerprint'")
-        p("Test before visiting: coveryourtracks.eff.org · browserleaks.com · pixelscan.net", indent=True)
-        div()
-
-        h("Layer 3 — Cookies & storage")
-        p("Never open a new account in the same browser profile as the old one.")
-        p("GoLogin/AdsPower create fully isolated profiles — this is automatic.")
-        p("Without them: a fresh incognito window + clear all site data first.")
-        div()
-
-        h("Layer 4 — Email")
-        p("Use a brand-new email never associated with the platform.")
-        p("ProtonMail (proton.me) — no phone · SimpleLogin / AnonAddy — aliases", indent=True)
-        div()
-
-        h("Layer 5 — Payment")
-        p("Card numbers are permanently linked to your real identity.")
-        p("Privacy.com (US) · Revolut / Wise prepaid virtual cards", indent=True)
-        div()
-
-        h("Match the proxy country to your identity", C["mauve"])
-        p("Use the 'Country for next proxy' selector to keep your IP consistent with")
-        p("the email, address, and payment details on the account. A US account logging")
-        p("in from five countries in an hour is an obvious flag.")
-        div()
-
-        h("If an account gets banned", C["yellow"])
-        p("Try appealing first — many wrongly-flagged accounts are reinstated.")
-        p("If final: make sure every layer (IP, fingerprint, cookies, email, payment)")
-        p("is fresh before the next attempt. A new IP alone is not enough.")
-        tk.Frame(inner, bg=C["bg"], height=20).pack()
 
     # ── Filters ───────────────────────────────────────────────────────────────
     def _on_filters_change(self, _evt=None):
@@ -688,30 +649,32 @@ class App:
     def _refresh_status(self):
         counts = self._manager.countries()
         total = sum(counts.values())
-        top = "  ".join(f"{cc}:{n}" for cc, n in counts.most_common(6))
-        self._queue_var.set(f"{total} ready" + (f"   ({top})" if top else ""))
+        self._stat_queue.set(str(total))
+        self._stat_verif.set(str(self._manager.verified_total))
+        self._stat_tested.set(str(self._manager.tested_total))
+        self._stat_rot.set(str(self._rotations))
 
-        # Keep country dropdown in sync without disturbing the current selection.
-        current = self._country_var.get()
-        values = ["Any"] + [f"{cc} ({n})" for cc, n in counts.most_common()]
+        if counts:
+            mix = "   ".join(f"{cc} {n}" for cc, n in counts.most_common(8))
+            self._countries_var.set("In queue:   " + mix)
+        else:
+            self._countries_var.set("No countries discovered yet")
+
+        values = ["Any"] + [f"{cc}  ({n})" for cc, n in counts.most_common()]
         codes  = ["Any"] + [cc for cc, _ in counts.most_common()]
         self._country_cb["values"] = values
         self._country_codes = codes
-        # Preserve selection by code even as counts change the label text.
-        sel_code = getattr(self, "_sel_country_code", "Any")
-        if sel_code in codes:
-            self._country_var.set(values[codes.index(sel_code)])
+        if self._sel_country_code in codes:
+            self._country_var.set(values[codes.index(self._sel_country_code)])
 
     def _tick_status(self):
         self._refresh_status()
-        self.root.after(1500, self._tick_status)
+        self.root.after(1200, self._tick_status)
 
     def _selected_country(self):
-        """Resolve the dropdown selection back to a bare country code."""
         val = self._country_var.get()
-        code = val.split(" ")[0] if val else "Any"
-        self._sel_country_code = code
-        return code
+        self._sel_country_code = val.split(" ")[0] if val else "Any"
+        return self._sel_country_code
 
     # ── Logging ───────────────────────────────────────────────────────────────
     def _log(self, text):
@@ -719,6 +682,11 @@ class App:
         self._log_widget.config(state="normal")
         self._log_widget.insert("end", f"[{ts}] {text}\n")
         self._log_widget.see("end")
+        self._log_widget.config(state="disabled")
+
+    def _clear_log(self):
+        self._log_widget.config(state="normal")
+        self._log_widget.delete("1.0", "end")
         self._log_widget.config(state="disabled")
 
     # ── IP refresh ────────────────────────────────────────────────────────────
@@ -734,7 +702,7 @@ class App:
                 r = requests.get(url, timeout=10, **kw)
                 ip = extractor(r)
                 if ip and "." in ip:
-                    tag = f"  ({self._current.cc})" if self._current else ""
+                    tag = f"   {self._current.cc}" if self._current else ""
                     self.root.after(0, self._ip_var.set, ip + tag)
                     self.root.after(0, self._dot.config, {"fg": C["green"]})
                     return
@@ -747,7 +715,7 @@ class App:
     def _disable_proxy_and_refresh(self):
         SystemProxy.disable()
         self._current = None
-        self._active_var.set("none")
+        self._active_var.set("Proxy: none  ·  direct connection")
         self._log("Proxy disabled — using direct connection.")
         self._refresh_ip_async()
 
@@ -773,13 +741,12 @@ class App:
             return
         added = self._manager.add_custom(entries)
         self._log(f"Loaded {added} custom proxies (default protocol: {default}). "
-                  f"They'll be tested and prioritised.")
+                  "They'll be tested and prioritised.")
         if not self._running:
-            self._log("Tip: click Start Rotation to begin testing them.")
+            self._log("Tip: click Start to begin testing them.")
 
     def _export_working(self):
-        with self._manager._lock:
-            pool = list(self._manager._pool)
+        pool = self._manager.snapshot()
         if not pool:
             self._log("Nothing to export yet — queue is empty.")
             return
@@ -810,23 +777,20 @@ class App:
         self._running = True
         self._on_filters_change()
         manual = self._interval_var.get() == "Manual"
-        self._start_btn.config(text="■  Stop", bg=C["red"], fg="#1e1e2e")
+        self._start_btn.config(text="■  Stop", bg=C["red"])
         self._next_btn.config(state="normal")
         self._interval_cb.config(state="disabled")
         self._log("Manual mode — use '→ Next Proxy' to rotate." if manual
                   else "Rotation started — background fetcher running.")
         self._manager.start()
-        self._rotation_thread = threading.Thread(target=self._rotation_loop,
-                                                 daemon=True, name="rotator")
-        self._rotation_thread.start()
+        threading.Thread(target=self._rotation_loop, daemon=True, name="rotator").start()
         if self._health_var.get():
-            threading.Thread(target=self._health_loop, daemon=True,
-                             name="health").start()
+            threading.Thread(target=self._health_loop, daemon=True, name="health").start()
 
     def _stop(self):
         self._running = False
         self._manager.stop()
-        self._start_btn.config(text="▶  Start Rotation", bg=C["blue"], fg="#1e1e2e")
+        self._start_btn.config(text="▶  Start", bg=C["blue"])
         self._next_btn.config(state="disabled")
         self._interval_cb.config(state="readonly")
         self._cd_var.set("")
@@ -836,17 +800,17 @@ class App:
         self._progress["value"] = 0
         SystemProxy.disable()
         self._current = None
-        self._active_var.set("none")
+        self._active_var.set("Proxy: none  ·  direct connection")
         self._log("Stopped — proxy disabled, direct connection restored.")
         self._refresh_ip_async()
 
     def _apply_proxy(self, proxy: Proxy):
         host, port = proxy.addr.rsplit(":", 1)
-        # Strip any embedded credentials for the OS proxy host field.
-        host = host.split("@")[-1]
+        host = host.split("@")[-1]      # strip credentials for the OS host field
         if SystemProxy.enable(host, port, proxy.protocol):
             self._current = proxy
-            self._active_var.set(str(proxy))
+            self._rotations += 1
+            self._active_var.set(f"Proxy: {proxy}")
             self._log(f"→  Active: {proxy}")
             self._refresh_ip_async()
         else:
@@ -910,7 +874,6 @@ class App:
         self._progress["value"] = pct
 
     def _health_loop(self):
-        """Periodically verify the active proxy still works; rotate if it dies."""
         while self._running:
             for _ in range(HEALTH_INTERVAL):
                 if not self._running:
@@ -936,18 +899,15 @@ class App:
             s.theme_use("clam")
         except tk.TclError:
             pass
-        s.configure("TNotebook", background=C["bg"], borderwidth=0)
-        s.configure("TNotebook.Tab", background=C["panel"], foreground=C["dim"],
-                    padding=[12, 5], font=("Segoe UI", 9))
-        s.map("TNotebook.Tab", background=[("selected", C["blue"])],
-              foreground=[("selected", "#1e1e2e")])
         s.configure("TCombobox", fieldbackground=C["panel"], background=C["panel"],
                     foreground=C["text"], selectbackground=C["panel"],
-                    selectforeground=C["text"])
+                    selectforeground=C["text"], arrowcolor=C["dim"], bordercolor=C["muted"])
+        s.map("TCombobox", fieldbackground=[("readonly", C["panel"])],
+              foreground=[("readonly", C["text"])])
         s.configure("TProgressbar", troughcolor=C["panel"], background=C["blue"],
-                    borderwidth=0)
-        s.configure("TScrollbar", background=C["muted"], troughcolor=C["bg"],
-                    borderwidth=0)
+                    borderwidth=0, thickness=8)
+        s.configure("Vertical.TScrollbar", background=C["muted"], troughcolor=C["bg"],
+                    borderwidth=0, arrowcolor=C["dim"])
 
     # ── Entry point ───────────────────────────────────────────────────────────
     def _on_close(self):
@@ -959,8 +919,8 @@ class App:
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_ip_async()
-        self._log(f"Ready on {_SYS}. {SystemProxy.platform_note()}")
-        self._log("Click 'Start Rotation' — the proxy fetcher starts automatically.")
+        self._log(f"{self.APP_NAME} ready on {_SYS}. {SystemProxy.platform_note()}")
+        self._log("Click 'Start' — the proxy fetcher runs automatically.")
         self.root.mainloop()
 
 

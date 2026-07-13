@@ -1,142 +1,264 @@
 # -*- coding: utf-8 -*-
 """
-Anti-Detect Suite
------------------
-Smart IP rotation through verified proxies + anti-detect guide.
+Anti-Detect Suite — cross-platform smart IP rotation.
 
 Key behaviour:
-  - Background threads fetch & test proxies continuously from 7 sources.
-  - The queue ALWAYS has tested, working proxies ready.
-  - When the timer fires: if the next proxy is ready → rotate instantly.
-    If not ready yet → show "waiting…" and hold until one is verified.
-  - On close: Windows proxy is restored to direct connection.
+  - Background threads fetch & test proxies continuously from public sources
+    (HTTP / SOCKS4 / SOCKS5) plus any custom list you load.
+  - The queue ALWAYS holds tested, working proxies, each tagged with its
+    country and measured latency.
+  - When the timer fires: if a proxy matching your filters is ready → rotate
+    instantly. If not → show "waiting…" and hold until one is verified.
+  - Manual mode: pick the country for the *next* proxy, then click Next Proxy.
+  - Optional health check re-tests the active proxy and auto-rotates if it dies.
+  - On stop / close: the system proxy is restored to a direct connection.
 
-Affects: Chrome, Edge, Internet Explorer, and any app that follows
-Windows system proxy. Firefox has its own proxy setting (see Guide tab).
+Platforms:
+  - Windows : WinINET system proxy (Chrome, Edge, IE, and WinINET apps).
+  - Linux   : GNOME gsettings proxy (GNOME/Cinnamon/Unity apps that follow it).
+  - macOS   : networksetup on active network services.
+On any platform you can also just copy the active proxy string and paste it
+into an anti-detect browser (Multilogin / AdsPower / GoLogin) profile.
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, filedialog, messagebox
+from tkinter import ttk, scrolledtext, filedialog
 import threading
-import queue
-import random
+import platform
+import subprocess
 import time
-import winreg
-import ctypes
+import random
 import requests
-import json
-import string
-import hashlib
-import base64
-import uuid
-from datetime import datetime, timedelta
+from collections import Counter, deque
+from datetime import datetime
+
+# ── Platform detection & guarded imports ──────────────────────────────────────
+
+_SYS       = platform.system()
+IS_WINDOWS = _SYS == "Windows"
+IS_LINUX   = _SYS == "Linux"
+IS_MAC     = _SYS == "Darwin"
+
+if IS_WINDOWS:
+    import winreg
+    import ctypes
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
 
+# (url, protocol) — protocol is how the listed proxies must be dialled.
 PROXY_SOURCES = [
-    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=anonymous",
-    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=elite",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
-    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+    ("https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=anonymous", "http"),
+    ("https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=elite", "http"),
+    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt", "http"),
+    ("https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt", "http"),
+    ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt", "http"),
+    ("https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt", "http"),
+    ("https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt", "http"),
+    ("https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all", "socks4"),
+    ("https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all", "socks5"),
+    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt", "socks4"),
+    ("https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt", "socks5"),
+    ("https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt", "socks5"),
 ]
 
-# Plain HTTP — free proxies almost never support HTTPS tunneling (CONNECT)
-TEST_URL        = "http://ip-api.com/json/"
-# Secondary check: proxy must also reach a real website, not just the IP-lookup API
+# Step-1 test: proxy's own IP + geolocation (returns country fields we need).
+GEO_TEST_URL       = "http://ip-api.com/json/?fields=status,country,countryCode,query"
+# Step-2 test: prove the proxy reaches a real site, not just whitelisted APIs.
 SECONDARY_TEST_URL = "http://example.com"
-TEST_TIMEOUT    = 7      # seconds per proxy test
-TEST_WORKERS    = 14     # concurrent test threads
-QUEUE_LOW_MARK  = 5      # refetch when queue drops below this
-QUEUE_HIGH_MARK = 30     # stop testing when queue reaches this
-MAX_TEST_BATCH  = 350    # proxies tested per fetch cycle
 
-# Multiple HTTP-only IP check endpoints tried in order until one responds
+TEST_TIMEOUT    = 7      # seconds per proxy test
+TEST_WORKERS    = 16     # concurrent test threads
+QUEUE_LOW_MARK  = 8      # refetch when queue drops below this
+QUEUE_HIGH_MARK = 40     # stop testing when queue reaches this
+MAX_TEST_BATCH  = 400    # proxies tested per fetch cycle
+HEALTH_INTERVAL = 20     # seconds between active-proxy health checks
+
+# HTTP-only IP-check endpoints, tried in order until one responds.
 IP_CHECK_ENDPOINTS = [
-    # (url, extractor_fn)
-    ("http://ip-api.com/json/",              lambda r: r.json().get("query", "")),
-    ("http://api.ipify.org?format=json",     lambda r: r.json().get("ip", "")),
-    ("http://checkip.amazonaws.com/",        lambda r: r.text.strip()),
-    ("http://ifconfig.me/ip",               lambda r: r.text.strip()),
-    ("http://ipecho.net/plain",             lambda r: r.text.strip()),
+    ("http://ip-api.com/json/?fields=query,country,countryCode", lambda r: r.json().get("query", "")),
+    ("http://api.ipify.org?format=json",                          lambda r: r.json().get("ip", "")),
+    ("http://checkip.amazonaws.com/",                             lambda r: r.text.strip()),
+    ("http://ifconfig.me/ip",                                     lambda r: r.text.strip()),
+    ("http://ipecho.net/plain",                                   lambda r: r.text.strip()),
 ]
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 
 C = dict(
-    bg     = "#1e1e2e",
-    panel  = "#313244",
-    muted  = "#45475a",
-    text   = "#cdd6f4",
-    dim    = "#a6adc8",
-    hint   = "#6c7086",
-    blue   = "#89b4fa",
-    red    = "#f38ba8",
-    green  = "#a6e3a1",
-    yellow = "#f9e2af",
-    orange = "#fab387",
+    bg="#1e1e2e", panel="#313244", muted="#45475a", text="#cdd6f4",
+    dim="#a6adc8", hint="#6c7086", blue="#89b4fa", red="#f38ba8",
+    green="#a6e3a1", yellow="#f9e2af", orange="#fab387", mauve="#cba6f7",
 )
 
-# ── Windows proxy helpers ─────────────────────────────────────────────────────
 
-def _win_key(write: bool = False):
-    flag = winreg.KEY_WRITE if write else winreg.KEY_READ
-    return winreg.OpenKey(
-        winreg.HKEY_CURRENT_USER,
-        r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        0, flag,
-    )
+# ── Proxy model ───────────────────────────────────────────────────────────────
 
-def _notify_wininet():
-    """Tell WinInet to pick up the new proxy settings immediately."""
-    ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)  # SETTINGS_CHANGED
-    ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)  # REFRESH
+class Proxy:
+    """A single verified proxy with its measured metadata."""
+    __slots__ = ("addr", "protocol", "cc", "country", "latency")
 
-def enable_proxy(host: str, port: str) -> bool:
-    try:
-        key = _win_key(write=True)
+    def __init__(self, addr, protocol, cc, country, latency):
+        self.addr     = addr        # "host:port"
+        self.protocol = protocol    # http | socks4 | socks5
+        self.cc       = cc or "??"  # ISO country code, e.g. "US"
+        self.country  = country or "Unknown"
+        self.latency  = latency     # ms (int)
+
+    def requests_dict(self):
+        scheme = {"http": "http", "socks4": "socks4", "socks5": "socks5h"}[self.protocol]
+        url = f"{scheme}://{self.addr}"
+        return {"http": url, "https": url}
+
+    def __str__(self):
+        return f"{self.addr} [{self.protocol}] {self.cc} {self.latency}ms"
+
+
+# ── System proxy control (cross-platform) ─────────────────────────────────────
+
+class SystemProxy:
+    """Applies/removes the OS-level proxy so browsers follow it."""
+
+    # --- Windows (WinINET registry) ---
+    @staticmethod
+    def _win_key(write=False):
+        flag = winreg.KEY_WRITE if write else winreg.KEY_READ
+        return winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            0, flag,
+        )
+
+    @staticmethod
+    def _win_notify():
+        ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)  # SETTINGS_CHANGED
+        ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)  # REFRESH
+
+    @classmethod
+    def _win_enable(cls, host, port, protocol):
+        value = f"socks={host}:{port}" if protocol in ("socks4", "socks5") else f"{host}:{port}"
+        key = cls._win_key(write=True)
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{port}")
+        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, value)
         winreg.CloseKey(key)
-        _notify_wininet()
-        return True
-    except Exception:
-        return False
+        cls._win_notify()
 
-def disable_proxy():
-    try:
-        key = _win_key(write=True)
+    @classmethod
+    def _win_disable(cls):
+        key = cls._win_key(write=True)
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
         winreg.CloseKey(key)
-        _notify_wininet()
-    except Exception:
-        pass
+        cls._win_notify()
+
+    # --- Linux (GNOME gsettings) ---
+    @staticmethod
+    def _gset(*args):
+        subprocess.run(["gsettings", *args], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    @classmethod
+    def _linux_enable(cls, host, port, protocol):
+        cls._gset("set", "org.gnome.system.proxy", "mode", "manual")
+        if protocol in ("socks4", "socks5"):
+            cls._gset("set", "org.gnome.system.proxy.socks", "host", host)
+            cls._gset("set", "org.gnome.system.proxy.socks", "port", str(port))
+        else:
+            for scheme in ("http", "https"):
+                cls._gset("set", f"org.gnome.system.proxy.{scheme}", "host", host)
+                cls._gset("set", f"org.gnome.system.proxy.{scheme}", "port", str(port))
+
+    @classmethod
+    def _linux_disable(cls):
+        cls._gset("set", "org.gnome.system.proxy", "mode", "none")
+
+    # --- macOS (networksetup) ---
+    @staticmethod
+    def _mac_services():
+        out = subprocess.run(["networksetup", "-listallnetworkservices"],
+                             capture_output=True, text=True)
+        return [s for s in out.stdout.splitlines()[1:] if s and not s.startswith("*")]
+
+    @classmethod
+    def _mac_enable(cls, host, port, protocol):
+        socks = protocol in ("socks4", "socks5")
+        for svc in cls._mac_services():
+            if socks:
+                subprocess.run(["networksetup", "-setsocksfirewallproxy", svc, host, str(port)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                for cmd in ("-setwebproxy", "-setsecurewebproxy"):
+                    subprocess.run(["networksetup", cmd, svc, host, str(port)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    @classmethod
+    def _mac_disable(cls):
+        for svc in cls._mac_services():
+            for cmd in ("-setwebproxystate", "-setsecurewebproxystate", "-setsocksfirewallproxystate"):
+                subprocess.run(["networksetup", cmd, svc, "off"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # --- Public API ---
+    @classmethod
+    def enable(cls, host, port, protocol) -> bool:
+        try:
+            if IS_WINDOWS:  cls._win_enable(host, port, protocol)
+            elif IS_LINUX:  cls._linux_enable(host, port, protocol)
+            elif IS_MAC:    cls._mac_enable(host, port, protocol)
+            else:           return False
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def disable(cls):
+        try:
+            if IS_WINDOWS:  cls._win_disable()
+            elif IS_LINUX:  cls._linux_disable()
+            elif IS_MAC:    cls._mac_disable()
+        except Exception:
+            pass
+
+    @staticmethod
+    def platform_note() -> str:
+        if IS_WINDOWS: return "Windows system proxy (Chrome, Edge, WinINET apps)."
+        if IS_LINUX:   return "GNOME gsettings proxy (apps that follow it)."
+        if IS_MAC:     return "macOS networksetup proxy on active services."
+        return "Unsupported OS — copy the proxy into your browser manually."
+
 
 # ── Background proxy manager ──────────────────────────────────────────────────
 
 class ProxyManager:
     """
-    Runs a background fetch-loop that continuously replenishes a queue of
-    verified working proxies. Completely separate from the rotation timer.
+    Continuously fetches, tests and geo-tags proxies into a country-aware pool.
+    Thread-safe. The rotation loop pulls from it, optionally filtered by country.
     """
 
-    def __init__(self, on_log, on_count_change):
-        self._log   = on_log
-        self._count = on_count_change
-        self._q: queue.Queue[str] = queue.Queue()
-        self._seen: set[str]      = set()
-        self._seen_lock           = threading.Lock()
-        self._sem                 = threading.Semaphore(TEST_WORKERS)
-        self._active              = False
+    def __init__(self, on_log, on_change):
+        self._log       = on_log
+        self._change    = on_change              # called with () after pool changes
+        self._pool: deque[Proxy] = deque()
+        self._lock      = threading.Lock()
+        self._seen      = set()
+        self._seen_lock = threading.Lock()
+        self._sem       = threading.Semaphore(TEST_WORKERS)
+        self._active    = False
+        self._custom: list[tuple[str, str]] = []   # (addr, protocol) user-provided
 
-    # ── Public interface ──────────────────────────────────────────────────────
+        # Live filters (set from the UI thread; read by workers).
+        self.protocol_filter = "all"   # all | http | socks4 | socks5
+        self.max_latency     = 0       # ms; 0 = no cap
 
+    # ── Introspection ──
     @property
     def ready(self) -> int:
-        return self._q.qsize()
+        with self._lock:
+            return len(self._pool)
 
+    def countries(self) -> Counter:
+        with self._lock:
+            return Counter(p.cc for p in self._pool)
+
+    # ── Lifecycle ──
     def start(self):
         if not self._active:
             self._active = True
@@ -146,23 +268,54 @@ class ProxyManager:
     def stop(self):
         self._active = False
 
-    def get_next(self) -> str | None:
-        try:
-            return self._q.get_nowait()
-        except queue.Empty:
-            return None
+    def add_custom(self, entries):
+        """entries: list of (addr, protocol). Retried every cycle until working."""
+        added = 0
+        with self._lock:
+            existing = {a for a, _ in self._custom}
+            for addr, proto in entries:
+                if addr not in existing:
+                    self._custom.append((addr, proto))
+                    existing.add(addr)
+                    added += 1
+        return added
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    def get_next(self, cc=None) -> Proxy | None:
+        """Pop the next proxy, optionally the first one matching a country code."""
+        with self._lock:
+            if not self._pool:
+                return None
+            if cc and cc != "Any":
+                for i, p in enumerate(self._pool):
+                    if p.cc == cc:
+                        del self._pool[i]
+                        return p
+                return None
+            return self._pool.popleft()
+
+    # ── Internal ──
+    def _sources(self):
+        pf = self.protocol_filter
+        for url, proto in PROXY_SOURCES:
+            if pf == "all" or pf == proto:
+                yield url, proto
 
     def _fetch_loop(self):
         while self._active:
-            if self._q.qsize() < QUEUE_LOW_MARK:
+            if self.ready < QUEUE_LOW_MARK:
                 self._fetch_batch()
-            time.sleep(8)
+            time.sleep(6)
 
     def _fetch_batch(self):
-        raw: set[str] = set()
-        for url in PROXY_SOURCES:
+        raw: list[tuple[str, str]] = []
+
+        # Custom proxies first — the user paid for these; keep retrying them.
+        pf = self.protocol_filter
+        for addr, proto in list(self._custom):
+            if pf == "all" or pf == proto:
+                raw.append((addr, proto))
+
+        for url, proto in self._sources():
             if not self._active:
                 return
             try:
@@ -170,234 +323,101 @@ class ProxyManager:
                 for line in r.text.splitlines():
                     line = line.strip()
                     if ":" in line and len(line) < 24 and " " not in line:
-                        raw.add(line)
+                        raw.append((line, proto))
             except Exception:
                 pass
 
         with self._seen_lock:
-            new = [p for p in raw if p not in self._seen]
+            custom_addrs = {a for a, _ in self._custom}
+            new = [(a, pr) for a, pr in raw if a in custom_addrs or a not in self._seen]
         random.shuffle(new)
-        self._log(f"Fetched {len(raw)} proxies, testing {min(len(new), MAX_TEST_BATCH)} new ones…")
+        batch = new[:MAX_TEST_BATCH]
+        self._log(f"Fetched {len(raw)} candidates — testing {len(batch)}…")
 
-        for proxy in new[:MAX_TEST_BATCH]:
-            if not self._active or self._q.qsize() >= QUEUE_HIGH_MARK:
+        for addr, proto in batch:
+            if not self._active or self.ready >= QUEUE_HIGH_MARK:
                 break
-            threading.Thread(target=self._test_one, args=(proxy,),
+            threading.Thread(target=self._test_one, args=(addr, proto),
                              daemon=True).start()
 
-    def _test_one(self, proxy: str):
+    def _test_one(self, addr, proto):
         with self._sem:
-            if self._q.qsize() >= QUEUE_HIGH_MARK:
+            if self.ready >= QUEUE_HIGH_MARK:
                 return
+            proxy = Proxy(addr, proto, None, None, 0)
+            p = proxy.requests_dict()
             try:
-                p = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
-
-                # Step 1: get the proxy's IP via ip-api
-                r = requests.get(TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
+                # Step 1: geolocation + latency.
+                t0 = time.time()
+                r = requests.get(GEO_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
+                latency = int((time.time() - t0) * 1000)
                 if r.status_code != 200:
                     return
                 data = r.json()
+                if data.get("status") != "success":
+                    return
                 ip = data.get("query", "")
                 if not ip or "." not in ip:
                     return
 
-                # Step 2: confirm the proxy can reach a real website, not just the
-                # IP-lookup API. Filters proxies that only answer whitelisted endpoints.
+                if self.max_latency and latency > self.max_latency:
+                    return
+
+                # Step 2: reach a real website, not just the IP-lookup API.
                 r2 = requests.get(SECONDARY_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
                 if r2.status_code not in (200, 301, 302):
                     return
 
-                should_add = False
-                with self._seen_lock:
-                    if proxy not in self._seen:
-                        self._seen.add(proxy)
-                        should_add = True
-                if should_add:
-                    self._q.put(proxy)
-                    n = self._q.qsize()
-                    self._log(f"✓  {proxy}  →  {ip}   (queue: {n})")
-                    self._count(n)
+                proxy.cc      = data.get("countryCode") or "??"
+                proxy.country = data.get("country") or "Unknown"
+                proxy.latency = latency
             except Exception:
-                pass
+                return
 
-# ── Cookie Randomizer ────────────────────────────────────────────────────────
+            with self._seen_lock:
+                if addr in self._seen:
+                    return
+                self._seen.add(addr)
+            with self._lock:
+                self._pool.append(proxy)
+                n = len(self._pool)
+            self._log(f"✓  {addr}  [{proto}]  {proxy.cc} {ip}  {latency}ms   (queue: {n})")
+            self._change()
 
-class CookieRandomizer:
+
+# ── Proxy list parsing ────────────────────────────────────────────────────────
+
+def parse_proxy_line(line, default_proto="http"):
     """
-    Generates a realistic multi-site browsing history for Multilogin / AdsPower profiles.
-    All cookies are client-side analytics only — no fake server-validated tokens.
-    Timestamps are spread over the chosen profile age so the browser looks genuinely used.
+    Accepts several common formats and returns (addr, protocol) or None:
+      host:port
+      protocol://host:port
+      host:port:user:pass          (auth folded into addr for requests)
+      protocol://user:pass@host:port
     """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
 
-    # Sites a normal person visits; flagged with whether they use FB pixel & Hotjar
-    # (domain, uses_fbp, uses_hotjar, uses_ga4)
-    _SITES = [
-        ("google.com",      False, False, True),
-        ("youtube.com",     False, False, True),
-        ("reddit.com",      True,  False, True),
-        ("amazon.com",      True,  False, True),
-        ("facebook.com",    True,  False, False),
-        ("instagram.com",   True,  False, False),
-        ("twitter.com",     False, False, True),
-        ("linkedin.com",    True,  True,  True),
-        ("netflix.com",     False, False, True),
-        ("wikipedia.org",   False, False, False),
-        ("github.com",      False, True,  True),
-        ("pinterest.com",   True,  False, True),
-        ("ebay.com",        True,  True,  True),
-        ("etsy.com",        True,  True,  True),
-        ("spotify.com",     False, True,  True),
-        ("twitch.tv",       True,  False, True),
-        ("microsoft.com",   False, False, True),
-        ("apple.com",       False, False, True),
-        ("cnn.com",         True,  False, True),
-        ("nytimes.com",     True,  True,  True),
-        ("quora.com",       True,  True,  True),
-        ("stackoverflow.com",False,True,  True),
-        ("medium.com",      True,  True,  True),
-        ("shopify.com",     True,  True,  True),
-        ("wordpress.com",   False, True,  True),
-    ]
+    proto = default_proto
+    if "://" in line:
+        proto, line = line.split("://", 1)
+        proto = proto.lower()
+        if proto not in ("http", "https", "socks4", "socks5"):
+            proto = default_proto
+        if proto == "https":
+            proto = "http"
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    if "@" in line:                        # user:pass@host:port
+        return (line, proto)
 
-    @staticmethod
-    def _hextoken(n: int) -> str:
-        return ''.join(random.choices('0123456789abcdef', k=n))
-
-    @staticmethod
-    def _b64token(n: int) -> str:
-        raw = bytes(random.randint(0, 255) for _ in range(n))
-        return base64.urlsafe_b64encode(raw).decode()[:n]
-
-    @staticmethod
-    def _ts(days_ago_max: int, days_ago_min: int = 0) -> int:
-        """Random Unix timestamp between days_ago_min and days_ago_max days ago."""
-        now = int(time.time())
-        offset = random.randint(int(days_ago_min * 86400), int(days_ago_max * 86400))
-        return now - offset
-
-    @staticmethod
-    def _future_ts(days: int) -> int:
-        return int(time.time()) + days * 86400
-
-    # ── Per-site cookie builders ──────────────────────────────────────────────
-
-    def _ga_cookies(self, domain: str, first_visit: int, age_days: int) -> list[dict]:
-        """Google Analytics 4 + UA cookies for one domain."""
-        cid    = f"{random.randint(10**9, 10**10-1)}.{first_visit}"
-        net    = random.randint(1, 3)
-        cookies = [
-            {
-                "name":     "_ga",
-                "value":    f"GA1.{net}.{cid}",
-                "domain":   f".{domain}",
-                "path":     "/",
-                "expires":  self._future_ts(730),
-                "httpOnly": False,
-                "secure":   False,
-                "sameSite": "Lax",
-            },
-            {
-                "name":     f"_ga_{self._hextoken(8).upper()[:8]}",
-                "value":    f"GS1.1.{self._ts(1)}.{random.randint(1,30)}.1.{self._ts(0,0)}.0.0.0",
-                "domain":   f".{domain}",
-                "path":     "/",
-                "expires":  self._future_ts(730),
-                "httpOnly": False,
-                "secure":   False,
-                "sameSite": "Lax",
-            },
-            {
-                "name":     "_gid",
-                "value":    f"GA1.{net}.{random.randint(10**9,10**10-1)}.{self._ts(0)}",
-                "domain":   f".{domain}",
-                "path":     "/",
-                "expires":  self._future_ts(1),
-                "httpOnly": False,
-                "secure":   False,
-                "sameSite": "Lax",
-            },
-        ]
-        return cookies
-
-    def _fbp_cookie(self, domain: str, first_visit: int) -> dict:
-        return {
-            "name":     "_fbp",
-            "value":    f"fb.1.{first_visit * 1000}.{random.randint(10**8, 10**9-1)}",
-            "domain":   f".{domain}",
-            "path":     "/",
-            "expires":  self._future_ts(90),
-            "httpOnly": False,
-            "secure":   False,
-            "sameSite": "Lax",
-        }
-
-    def _hjid_cookies(self, domain: str) -> list[dict]:
-        hjid = str(uuid.uuid4())
-        return [
-            {
-                "name":     "_hjid",
-                "value":    hjid,
-                "domain":   f".{domain}",
-                "path":     "/",
-                "expires":  self._future_ts(365),
-                "httpOnly": False,
-                "secure":   False,
-                "sameSite": "Lax",
-            },
-            {
-                "name":     "_hjSessionUser_" + str(random.randint(1000000, 9999999)),
-                "value":    json.dumps({"id": hjid, "created": self._ts(1), "future": False}),
-                "domain":   f".{domain}",
-                "path":     "/",
-                "expires":  self._future_ts(365),
-                "httpOnly": False,
-                "secure":   False,
-                "sameSite": "Lax",
-            },
-        ]
-
-    def _consent_cookie(self, domain: str) -> dict:
-        stamp = self._b64token(28)
-        return {
-            "name":     "OptanonAlertBoxClosed",
-            "value":    datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-            "domain":   f".{domain}",
-            "path":     "/",
-            "expires":  self._future_ts(365),
-            "httpOnly": False,
-            "secure":   False,
-            "sameSite": "Lax",
-        }
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def generate_profile(self, age_days: int, site_count: int) -> list[dict]:
-        """
-        Build a full browsing-history cookie set for a Multilogin profile.
-        age_days  — how old the profile should look (e.g. 90 = visited sites over past 3 months)
-        site_count — how many sites to include (sampled from _SITES)
-        """
-        sites = random.sample(self._SITES, min(site_count, len(self._SITES)))
-        all_cookies: list[dict] = []
-
-        for domain, uses_fbp, uses_hj, uses_ga in sites:
-            # Spread first-visit timestamps across the profile age
-            first_visit = self._ts(age_days, max(1, age_days // 4))
-
-            if uses_ga:
-                all_cookies += self._ga_cookies(domain, first_visit, age_days)
-            if uses_fbp:
-                all_cookies.append(self._fbp_cookie(domain, first_visit))
-            if uses_hj:
-                all_cookies += self._hjid_cookies(domain)
-            if random.random() < 0.4:
-                all_cookies.append(self._consent_cookie(domain))
-
-        # Sort by domain so Multilogin import is tidy
-        all_cookies.sort(key=lambda c: c["domain"])
-        return all_cookies
+    parts = line.split(":")
+    if len(parts) == 2:
+        return (line, proto)
+    if len(parts) == 4:                    # host:port:user:pass
+        host, port, user, pw = parts
+        return (f"{user}:{pw}@{host}:{port}", proto)
+    return None
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -406,291 +426,170 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Anti-Detect Suite")
-        self.root.geometry("740x620")
-        self.root.resizable(False, False)
+        self.root.geometry("760x680")
+        self.root.minsize(720, 620)
         self.root.configure(bg=C["bg"])
 
-        self._running        = False
-        self._current_proxy  = None
+        self._running       = False
+        self._current: Proxy | None = None
         self._rotation_thread: threading.Thread | None = None
-        self._cookie_gen     = CookieRandomizer()
 
         self._manager = ProxyManager(
-            on_log          = lambda msg: self.root.after(0, self._log, msg),
-            on_count_change = lambda n:   self.root.after(0, self._update_queue_label, n),
+            on_log    = lambda msg: self.root.after(0, self._log, msg),
+            on_change = lambda: self.root.after(0, self._refresh_status),
         )
 
         self._build_ui()
         self._apply_style()
+        self.root.after(1500, self._tick_status)   # periodic country/queue refresh
 
     # ── UI skeleton ───────────────────────────────────────────────────────────
-
     def _build_ui(self):
-        # App title strip
         bar = tk.Frame(self.root, bg=C["panel"])
         bar.pack(fill="x")
         tk.Label(bar, text="Anti-Detect Suite", font=("Segoe UI", 13, "bold"),
                  bg=C["panel"], fg=C["text"], pady=8).pack(side="left", padx=16)
-        tk.Label(bar, text="smart IP rotation + fingerprint guide",
+        tk.Label(bar, text=f"smart IP rotation · {_SYS}",
                  font=("Segoe UI", 9), bg=C["panel"], fg=C["hint"]).pack(side="left")
 
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True, padx=16, pady=12)
-
         self._build_rotator_tab(nb)
-        self._build_cookie_tab(nb)
         self._build_guide_tab(nb)
 
     # ── Rotator tab ───────────────────────────────────────────────────────────
-
     def _build_rotator_tab(self, nb):
         tab = tk.Frame(nb, bg=C["bg"])
         nb.add(tab, text="  IP Rotator  ")
 
-        # ── Current IP ──
+        # Current IP card
         ip_card = tk.Frame(tab, bg=C["panel"])
         ip_card.pack(fill="x", pady=(8, 4))
-
         tk.Label(ip_card, text="Current IP", bg=C["panel"], fg=C["dim"],
                  font=("Segoe UI", 9)).pack(side="left", padx=14, pady=10)
-
         self._ip_var = tk.StringVar(value="fetching…")
         tk.Label(ip_card, textvariable=self._ip_var, bg=C["panel"], fg=C["blue"],
                  font=("Segoe UI", 13, "bold")).pack(side="left", padx=6)
-
         self._dot = tk.Label(ip_card, text="●", bg=C["panel"], fg=C["hint"],
-                              font=("Segoe UI", 11))
+                             font=("Segoe UI", 11))
         self._dot.pack(side="left", padx=3)
-
         tk.Button(ip_card, text="Refresh", command=self._refresh_ip_async,
                   bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
                   font=("Segoe UI", 9), padx=9, pady=4).pack(side="right", padx=12)
 
-        # ── Queue status ──
-        q_row = tk.Frame(tab, bg=C["bg"])
-        q_row.pack(fill="x", pady=(4, 0))
+        # Active proxy + queue status
+        st = tk.Frame(tab, bg=C["bg"])
+        st.pack(fill="x", pady=(4, 0))
+        tk.Label(st, text="Active proxy:", bg=C["bg"], fg=C["dim"],
+                 font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
+        self._active_var = tk.StringVar(value="none")
+        tk.Label(st, textvariable=self._active_var, bg=C["bg"], fg=C["green"],
+                 font=("Consolas", 9)).grid(row=0, column=1, sticky="w", padx=6)
+        tk.Button(st, text="Copy", command=self._copy_active,
+                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
+                  font=("Segoe UI", 8), padx=6).grid(row=0, column=2, padx=4)
 
-        tk.Label(q_row, text="Proxy queue:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left")
-
+        tk.Label(st, text="Queue:", bg=C["bg"], fg=C["dim"],
+                 font=("Segoe UI", 9)).grid(row=1, column=0, sticky="w", pady=(3, 0))
         self._queue_var = tk.StringVar(value="idle")
-        tk.Label(q_row, textvariable=self._queue_var, bg=C["bg"], fg=C["yellow"],
-                 font=("Segoe UI", 9, "bold")).pack(side="left", padx=6)
-
+        tk.Label(st, textvariable=self._queue_var, bg=C["bg"], fg=C["yellow"],
+                 font=("Segoe UI", 9, "bold")).grid(row=1, column=1, sticky="w",
+                                                    padx=6, pady=(3, 0))
         self._wait_var = tk.StringVar(value="")
-        tk.Label(q_row, textvariable=self._wait_var, bg=C["bg"], fg=C["orange"],
-                 font=("Segoe UI", 9, "italic")).pack(side="left")
+        tk.Label(st, textvariable=self._wait_var, bg=C["bg"], fg=C["orange"],
+                 font=("Segoe UI", 9, "italic")).grid(row=1, column=3, sticky="w",
+                                                      pady=(3, 0))
 
-        # ── Interval control ──
-        ctrl = tk.Frame(tab, bg=C["bg"])
-        ctrl.pack(fill="x", pady=8)
-
-        tk.Label(ctrl, text="Rotate every:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 10)).pack(side="left")
-
+        # Options row 1: interval / latency / protocol
+        opt1 = tk.Frame(tab, bg=C["bg"])
+        opt1.pack(fill="x", pady=(10, 2))
+        tk.Label(opt1, text="Rotate every:", bg=C["bg"], fg=C["dim"],
+                 font=("Segoe UI", 9)).pack(side="left")
         self._interval_var = tk.StringVar(value="30")
         self._interval_cb = ttk.Combobox(
-            ctrl, textvariable=self._interval_var,
-            values=["Manual", "15", "30", "45", "60", "90", "120"],
-            width=7, font=("Segoe UI", 10), state="readonly",
-        )
+            opt1, textvariable=self._interval_var,
+            values=["Manual", "15", "30", "45", "60", "90", "120", "300"],
+            width=7, font=("Segoe UI", 9), state="readonly")
         self._interval_cb.pack(side="left", padx=6)
+        tk.Label(opt1, text="s", bg=C["bg"], fg=C["hint"],
+                 font=("Segoe UI", 9)).pack(side="left")
 
-        tk.Label(ctrl,
-                 text="seconds   |   'Manual' = no auto-rotate, use Next Proxy button",
-                 bg=C["bg"], fg=C["hint"], font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(opt1, text="Max latency:", bg=C["bg"], fg=C["dim"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(18, 0))
+        self._lat_var = tk.StringVar(value="Any")
+        lat_cb = ttk.Combobox(opt1, textvariable=self._lat_var,
+                              values=["Any", "1000", "2000", "3000", "5000"],
+                              width=6, font=("Segoe UI", 9), state="readonly")
+        lat_cb.pack(side="left", padx=6)
+        lat_cb.bind("<<ComboboxSelected>>", self._on_filters_change)
 
-        # ── Buttons ──
-        btn_row = tk.Frame(tab, bg=C["bg"])
-        btn_row.pack(pady=4)
+        tk.Label(opt1, text="Protocol:", bg=C["bg"], fg=C["dim"],
+                 font=("Segoe UI", 9)).pack(side="left", padx=(18, 0))
+        self._proto_var = tk.StringVar(value="all")
+        proto_cb = ttk.Combobox(opt1, textvariable=self._proto_var,
+                                values=["all", "http", "socks4", "socks5"],
+                                width=7, font=("Segoe UI", 9), state="readonly")
+        proto_cb.pack(side="left", padx=6)
+        proto_cb.bind("<<ComboboxSelected>>", self._on_filters_change)
 
-        self._start_btn = tk.Button(
-            btn_row, text="▶  Start Rotation", command=self._toggle,
-            bg=C["blue"], fg="#1e1e2e", relief="flat", cursor="hand2",
-            font=("Segoe UI", 10, "bold"), padx=18, pady=7,
-        )
-        self._start_btn.pack(side="left", padx=5)
+        # Options row 2: country + health check
+        opt2 = tk.Frame(tab, bg=C["bg"])
+        opt2.pack(fill="x", pady=(2, 2))
+        tk.Label(opt2, text="Country for next proxy:", bg=C["bg"], fg=C["mauve"],
+                 font=("Segoe UI", 9, "bold")).pack(side="left")
+        self._country_var = tk.StringVar(value="Any")
+        self._country_cb = ttk.Combobox(opt2, textvariable=self._country_var,
+                                        values=["Any"], width=22,
+                                        font=("Segoe UI", 9), state="readonly")
+        self._country_cb.pack(side="left", padx=6)
+        self._country_cb.bind("<<ComboboxSelected>>",
+                              lambda _e: self._selected_country())
 
-        self._next_btn = tk.Button(
-            btn_row, text="→ Next Proxy", command=self._force_rotate,
-            bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-            font=("Segoe UI", 10), padx=12, pady=7, state="disabled",
-        )
-        self._next_btn.pack(side="left", padx=5)
+        self._health_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(opt2, text="Auto-recheck active proxy", variable=self._health_var,
+                       bg=C["bg"], fg=C["dim"], selectcolor=C["panel"],
+                       activebackground=C["bg"], activeforeground=C["text"],
+                       font=("Segoe UI", 9)).pack(side="left", padx=(18, 0))
 
-        tk.Button(
-            btn_row, text="Disable Proxy", command=self._disable_proxy_and_refresh,
-            bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-            font=("Segoe UI", 10), padx=12, pady=7,
-        ).pack(side="left", padx=5)
+        # Buttons
+        btn = tk.Frame(tab, bg=C["bg"])
+        btn.pack(pady=8)
+        self._start_btn = tk.Button(btn, text="▶  Start Rotation", command=self._toggle,
+                                    bg=C["blue"], fg="#1e1e2e", relief="flat", cursor="hand2",
+                                    font=("Segoe UI", 10, "bold"), padx=16, pady=7)
+        self._start_btn.pack(side="left", padx=4)
+        self._next_btn = tk.Button(btn, text="→ Next Proxy", command=self._force_rotate,
+                                   bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
+                                   font=("Segoe UI", 10), padx=12, pady=7, state="disabled")
+        self._next_btn.pack(side="left", padx=4)
+        tk.Button(btn, text="Disable Proxy", command=self._disable_proxy_and_refresh,
+                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
+                  font=("Segoe UI", 10), padx=12, pady=7).pack(side="left", padx=4)
+        tk.Button(btn, text="Load list…", command=self._load_custom,
+                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
+                  font=("Segoe UI", 10), padx=12, pady=7).pack(side="left", padx=4)
+        tk.Button(btn, text="Export working", command=self._export_working,
+                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
+                  font=("Segoe UI", 10), padx=12, pady=7).pack(side="left", padx=4)
 
-        # ── Countdown ──
-        cd_frame = tk.Frame(tab, bg=C["bg"])
-        cd_frame.pack(fill="x", pady=(4, 2))
-
+        # Countdown / progress
+        cd = tk.Frame(tab, bg=C["bg"])
+        cd.pack(fill="x", pady=(4, 2))
         self._cd_var = tk.StringVar(value="")
-        tk.Label(cd_frame, textvariable=self._cd_var, bg=C["bg"], fg=C["dim"],
+        tk.Label(cd, textvariable=self._cd_var, bg=C["bg"], fg=C["dim"],
                  font=("Segoe UI", 9)).pack(anchor="w")
-
-        self._progress = ttk.Progressbar(cd_frame, mode="determinate", length=666)
+        self._progress = ttk.Progressbar(cd, mode="determinate")
         self._progress.pack(fill="x", pady=2)
 
-        # ── Log ──
+        # Log
         tk.Label(tab, text="Activity log", bg=C["bg"], fg=C["dim"],
                  font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(6, 1))
-
         self._log_widget = scrolledtext.ScrolledText(
-            tab, height=9, bg="#181825", fg=C["text"],
-            font=("Consolas", 9), relief="flat", bd=0,
-            insertbackground=C["text"], state="disabled",
-        )
+            tab, height=10, bg="#181825", fg=C["text"], font=("Consolas", 9),
+            relief="flat", bd=0, insertbackground=C["text"], state="disabled")
         self._log_widget.pack(fill="both", expand=True)
 
-    # ── Cookie Randomizer tab ─────────────────────────────────────────────────
-
-    def _build_cookie_tab(self, nb):
-        tab = tk.Frame(nb, bg=C["bg"])
-        nb.add(tab, text="  Cookie Randomizer  ")
-
-        # ── Header ──
-        hdr = tk.Frame(tab, bg=C["panel"])
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="Cookie Randomizer", font=("Segoe UI", 11, "bold"),
-                 bg=C["panel"], fg=C["text"], pady=7).pack(side="left", padx=14)
-        tk.Label(hdr, text="builds a realistic multi-site browsing history for Multilogin / AdsPower profiles",
-                 font=("Segoe UI", 9), bg=C["panel"], fg=C["hint"]).pack(side="left")
-
-        body = tk.Frame(tab, bg=C["bg"])
-        body.pack(fill="both", expand=True, padx=14, pady=10)
-
-        # ── Info banner ──
-        info = tk.Frame(body, bg=C["panel"])
-        info.pack(fill="x", pady=(0, 10))
-        tk.Label(
-            info,
-            text=(
-                "  Only client-side analytics cookies (_ga, _gid, _fbp, _hjid) — the ones tracking scripts "
-                "actually read.\n  Timestamps are spread over the chosen age so the profile looks genuinely used, not brand-new."
-            ),
-            bg=C["panel"], fg=C["dim"], font=("Segoe UI", 8), justify="left",
-        ).pack(anchor="w", padx=8, pady=6)
-
-        # ── Row 1: profile age + site count ──
-        row1 = tk.Frame(body, bg=C["bg"])
-        row1.pack(fill="x", pady=(0, 8))
-
-        tk.Label(row1, text="Profile age:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left")
-        self._ck_age = ttk.Combobox(
-            row1,
-            values=["7 days", "30 days", "90 days", "180 days", "1 year"],
-            width=10, font=("Segoe UI", 10), state="readonly",
-        )
-        self._ck_age.set("90 days")
-        self._ck_age.pack(side="left", padx=(4, 24))
-
-        tk.Label(row1, text="Sites:", bg=C["bg"], fg=C["dim"],
-                 font=("Segoe UI", 9)).pack(side="left")
-        self._ck_sites = ttk.Combobox(
-            row1,
-            values=["10", "15", "20", "25"],
-            width=5, font=("Segoe UI", 10), state="readonly",
-        )
-        self._ck_sites.set("20")
-        self._ck_sites.pack(side="left", padx=(4, 0))
-        tk.Label(row1, text="popular sites", bg=C["bg"], fg=C["hint"],
-                 font=("Segoe UI", 9)).pack(side="left", padx=4)
-
-        # ── Row 2: action buttons ──
-        row2 = tk.Frame(body, bg=C["bg"])
-        row2.pack(fill="x", pady=(0, 8))
-
-        tk.Button(row2, text="⚄  Generate Profile", command=self._generate_cookies,
-                  bg=C["blue"], fg="#1e1e2e", relief="flat", cursor="hand2",
-                  font=("Segoe UI", 10, "bold"), padx=16, pady=6).pack(side="left", padx=(0, 6))
-
-        tk.Button(row2, text="Copy JSON", command=self._copy_cookies,
-                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-                  font=("Segoe UI", 10), padx=12, pady=6).pack(side="left", padx=4)
-
-        tk.Button(row2, text="Save to File…", command=self._save_cookies,
-                  bg=C["muted"], fg=C["text"], relief="flat", cursor="hand2",
-                  font=("Segoe UI", 10), padx=12, pady=6).pack(side="left", padx=4)
-
-        tk.Button(row2, text="Clear", command=self._clear_cookies,
-                  bg=C["muted"], fg=C["red"], relief="flat", cursor="hand2",
-                  font=("Segoe UI", 10), padx=12, pady=6).pack(side="left", padx=4)
-
-        self._ck_status = tk.StringVar(value="")
-        tk.Label(row2, textvariable=self._ck_status, bg=C["bg"], fg=C["green"],
-                 font=("Segoe UI", 9, "italic")).pack(side="left", padx=10)
-
-        # ── JSON output area ──
-        tk.Label(
-            body,
-            text="JSON output  —  paste directly into Multilogin / AdsPower / GoLogin cookie import field",
-            bg=C["bg"], fg=C["dim"], font=("Segoe UI", 9, "bold"),
-        ).pack(anchor="w", pady=(2, 2))
-
-        self._ck_output = scrolledtext.ScrolledText(
-            body, bg="#181825", fg=C["text"], font=("Consolas", 9),
-            relief="flat", bd=0, insertbackground=C["text"],
-        )
-        self._ck_output.pack(fill="both", expand=True)
-
-    # ── Cookie tab actions ────────────────────────────────────────────────────
-
-    _AGE_MAP = {"7 days": 7, "30 days": 30, "90 days": 90, "180 days": 180, "1 year": 365}
-
-    def _generate_cookies(self):
-        age_label = self._ck_age.get()
-        age_days  = self._AGE_MAP.get(age_label, 90)
-        try:
-            site_count = int(self._ck_sites.get())
-        except ValueError:
-            site_count = 20
-
-        cookies = self._cookie_gen.generate_profile(age_days, site_count)
-        output  = json.dumps(cookies, indent=2)
-
-        self._ck_output.config(state="normal")
-        self._ck_output.delete("1.0", "end")
-        self._ck_output.insert("end", output)
-
-        domains = len({c["domain"] for c in cookies})
-        self._ck_status.set(f"{len(cookies)} cookies across {domains} domains  |  profile age: {age_label}")
-
-    def _copy_cookies(self):
-        text = self._ck_output.get("1.0", "end").strip()
-        if not text:
-            self._ck_status.set("Nothing to copy — generate first.")
-            return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self._ck_status.set("Copied to clipboard!")
-
-    def _save_cookies(self):
-        text = self._ck_output.get("1.0", "end").strip()
-        if not text:
-            self._ck_status.set("Nothing to save — generate first.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            initialfile="profile_cookies.json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-        )
-        if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
-            self._ck_status.set(f"Saved → {path}")
-
-    def _clear_cookies(self):
-        self._ck_output.config(state="normal")
-        self._ck_output.delete("1.0", "end")
-        self._ck_status.set("")
-
     # ── Guide tab ─────────────────────────────────────────────────────────────
-
     def _build_guide_tab(self, nb):
         tab = tk.Frame(nb, bg=C["bg"])
         nb.add(tab, text="  Anti-Detect Guide  ")
@@ -698,179 +597,231 @@ class App:
         canvas = tk.Canvas(tab, bg=C["bg"], highlightthickness=0)
         sb = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
         inner = tk.Frame(canvas, bg=C["bg"])
-
         inner.bind("<Configure>",
                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=sb.set)
-
         canvas.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-
-        # Bind mousewheel
-        def _scroll(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _scroll)
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+        canvas.bind_all("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind_all("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
 
         def h(text, color=C["blue"]):
             tk.Label(inner, text=text, bg=C["bg"], fg=color,
                      font=("Segoe UI", 11, "bold")).pack(anchor="w", padx=14, pady=(14, 3))
 
         def p(text, indent=False):
-            pad = 28 if indent else 14
             tk.Label(inner, text=text, bg=C["bg"],
-                     fg=C["dim"] if indent else C["text"],
-                     font=("Segoe UI", 9), justify="left",
-                     wraplength=610).pack(anchor="w", padx=pad, pady=1)
+                     fg=C["dim"] if indent else C["text"], font=("Segoe UI", 9),
+                     justify="left", wraplength=630).pack(anchor="w",
+                     padx=28 if indent else 14, pady=1)
 
         def div():
             tk.Frame(inner, bg=C["muted"], height=1).pack(fill="x", padx=14, pady=8)
 
         h("How websites detect returning users", C["yellow"])
         p("① IP address           — changes with a proxy or VPN (this app handles this)")
-        p("② Browser fingerprint  — Canvas, WebGL GPU hash, fonts, screen size, timezone,")
-        p("                          installed plugins, CPU cores, memory → unique device hash", indent=True)
-        p("③ Cookies & storage    — session tokens saved in your browser across visits")
-        p("④ Behavioural signals  — mouse movement, typing speed, scroll patterns (ML-based)")
-        p("⑤ Email + payment      — permanently linked to your identity in their database")
-
+        p("② Browser fingerprint  — Canvas, WebGL GPU hash, fonts, screen, timezone,")
+        p("                          plugins, CPU cores, memory → unique device hash", indent=True)
+        p("③ Cookies & storage    — session tokens saved across visits")
+        p("④ Behavioural signals  — mouse movement, typing speed, scroll patterns")
+        p("⑤ Email + payment      — permanently linked to your identity")
         div()
 
         h("Layer 1 — IP rotation  (this app)", C["green"])
-        p("✔  7 proxy sources, 14 concurrent testers running in background.")
-        p("✔  Only verified, responsive proxies enter the queue.")
-        p("✔  Timer fires → if next proxy is ready, rotate instantly.")
-        p("✔  If not ready → pauses with 'waiting…' until one passes the test.")
-        p("✔  On Stop or window close: proxy is disabled, direct connection restored.")
-        p("⚠  Only affects Chrome, Edge, and WinInet apps. Firefox: set manually.", indent=True)
-
+        p(f"✔  Runs on {_SYS}: {SystemProxy.platform_note()}")
+        p("✔  HTTP + SOCKS4 + SOCKS5 sources, tested with concurrent workers.")
+        p("✔  Each proxy is geo-tagged — pick the country for the next rotation.")
+        p("✔  Load your own paid proxy list (host:port:user:pass supported).")
+        p("✔  Optional health check auto-rotates when the active proxy dies.")
+        p("✔  On Stop / close: proxy disabled, direct connection restored.")
+        p("⚠  Firefox uses its own proxy setting — or paste the proxy into your", indent=True)
+        p("   anti-detect browser profile directly (Copy button).", indent=True)
         div()
 
         h("Layer 2 — Browser fingerprint  (do this manually!)", C["red"])
-        p("This is what catches most people. Changing IP alone is not enough.")
-        p("")
-        p("Option A — GoLogin (recommended free option, 3 profiles)")
-        p("  Download: gologin.com  |  Spoofs Canvas, WebGL, fonts, User-Agent", indent=True)
-        p("Option B — AdsPower (2 free profiles)")
-        p("  Download: adspower.com  |  50+ spoofable parameters", indent=True)
-        p("Option C — Brave Browser")
-        p("  Settings → Privacy → 'Randomize fingerprint'  |  Fast, no install", indent=True)
-        p("")
-        p("Test your fingerprint BEFORE visiting the site:")
-        p("  coveryourtracks.eff.org      — EFF tracker test", indent=True)
-        p("  browserleaks.com             — detailed fingerprint breakdown", indent=True)
-        p("  pixelscan.net                — shows if you look like a bot", indent=True)
-
+        p("Changing IP alone is not enough. This is what catches most people.")
+        p("Option A — GoLogin (gologin.com, 3 free profiles): spoofs Canvas, WebGL, fonts, UA")
+        p("Option B — AdsPower (adspower.com, 2 free profiles): 50+ spoofable parameters")
+        p("Option C — Brave: Settings → Privacy → 'Randomize fingerprint'")
+        p("Test before visiting: coveryourtracks.eff.org · browserleaks.com · pixelscan.net", indent=True)
         div()
 
         h("Layer 3 — Cookies & storage")
-        p("Never open your new account in the same browser profile as the old one.")
+        p("Never open a new account in the same browser profile as the old one.")
         p("GoLogin/AdsPower create fully isolated profiles — this is automatic.")
-        p("Without them: use a fresh incognito window + clear all site data first.")
-
+        p("Without them: a fresh incognito window + clear all site data first.")
         div()
 
         h("Layer 4 — Email")
-        p("Use a brand-new email never associated with the platform before.")
-        p("  ProtonMail (proton.me)         — no phone number required", indent=True)
-        p("  SimpleLogin / AnonAddy         — alias forwarding for privacy", indent=True)
-
+        p("Use a brand-new email never associated with the platform.")
+        p("ProtonMail (proton.me) — no phone · SimpleLogin / AnonAddy — aliases", indent=True)
         div()
 
         h("Layer 5 — Payment")
         p("Card numbers are permanently linked to your real identity.")
-        p("  Privacy.com (US only)          — generates virtual card per merchant", indent=True)
-        p("  Revolut / Wise                 — prepaid virtual cards", indent=True)
-        p("  PayPal on a separate account   — separate email required", indent=True)
-
+        p("Privacy.com (US) · Revolut / Wise prepaid virtual cards", indent=True)
         div()
 
-        h("Complete free stack (all 5 layers covered)", C["green"])
-        p("1. This app + Proton VPN free tier          → clean IP")
-        p("2. GoLogin (3 free profiles)                → fingerprint + cookie isolation")
-        p("3. ProtonMail new address                   → clean email")
-        p("4. Privacy.com virtual card                 → clean payment")
-        p("5. Test at browserleaks.com before signing up")
-
+        h("Match the proxy country to your identity", C["mauve"])
+        p("Use the 'Country for next proxy' selector to keep your IP consistent with")
+        p("the email, address, and payment details on the account. A US account logging")
+        p("in from five countries in an hour is an obvious flag.")
         div()
 
         h("If an account gets banned", C["yellow"])
-        p("Before creating a new account, always try appealing first.")
-        p("  Find the platform's support email or help centre → submit an appeal.", indent=True)
-        p("  State clearly what happened and ask which rule was violated.", indent=True)
-        p("  Many wrongly-flagged accounts are reinstated quickly.", indent=True)
-        p("")
-        p("If the ban is final, make sure every layer above is clean before the next attempt.")
-        p("  A new IP alone is not enough — fingerprint, cookies, email and payment must all be fresh.", indent=True)
-
+        p("Try appealing first — many wrongly-flagged accounts are reinstated.")
+        p("If final: make sure every layer (IP, fingerprint, cookies, email, payment)")
+        p("is fresh before the next attempt. A new IP alone is not enough.")
         tk.Frame(inner, bg=C["bg"], height=20).pack()
 
-    # ── Logging ───────────────────────────────────────────────────────────────
+    # ── Filters ───────────────────────────────────────────────────────────────
+    def _on_filters_change(self, _evt=None):
+        self._manager.protocol_filter = self._proto_var.get()
+        lat = self._lat_var.get()
+        self._manager.max_latency = 0 if lat == "Any" else int(lat)
+        self._log(f"Filters — protocol: {self._proto_var.get()}, max latency: {lat}")
 
-    def _log(self, text: str):
+    # ── Status refresh ────────────────────────────────────────────────────────
+    def _refresh_status(self):
+        counts = self._manager.countries()
+        total = sum(counts.values())
+        top = "  ".join(f"{cc}:{n}" for cc, n in counts.most_common(6))
+        self._queue_var.set(f"{total} ready" + (f"   ({top})" if top else ""))
+
+        # Keep country dropdown in sync without disturbing the current selection.
+        current = self._country_var.get()
+        values = ["Any"] + [f"{cc} ({n})" for cc, n in counts.most_common()]
+        codes  = ["Any"] + [cc for cc, _ in counts.most_common()]
+        self._country_cb["values"] = values
+        self._country_codes = codes
+        # Preserve selection by code even as counts change the label text.
+        sel_code = getattr(self, "_sel_country_code", "Any")
+        if sel_code in codes:
+            self._country_var.set(values[codes.index(sel_code)])
+
+    def _tick_status(self):
+        self._refresh_status()
+        self.root.after(1500, self._tick_status)
+
+    def _selected_country(self):
+        """Resolve the dropdown selection back to a bare country code."""
+        val = self._country_var.get()
+        code = val.split(" ")[0] if val else "Any"
+        self._sel_country_code = code
+        return code
+
+    # ── Logging ───────────────────────────────────────────────────────────────
+    def _log(self, text):
         ts = datetime.now().strftime("%H:%M:%S")
         self._log_widget.config(state="normal")
         self._log_widget.insert("end", f"[{ts}] {text}\n")
         self._log_widget.see("end")
         self._log_widget.config(state="disabled")
 
-    def _update_queue_label(self, n: int):
-        self._queue_var.set(f"{n} ready")
-
     # ── IP refresh ────────────────────────────────────────────────────────────
-
     def _refresh_ip_async(self):
         threading.Thread(target=self._do_fetch_ip, daemon=True).start()
 
     def _do_fetch_ip(self):
-        kw: dict = {}
-        if self._current_proxy:
-            h, p = self._current_proxy.rsplit(":", 1)
-            # Use http:// only — free proxies rarely support HTTPS tunneling
-            kw["proxies"] = {"http": f"http://{h}:{p}"}
-
+        kw = {}
+        if self._current:
+            kw["proxies"] = self._current.requests_dict()
         for url, extractor in IP_CHECK_ENDPOINTS:
             try:
                 r = requests.get(url, timeout=10, **kw)
                 ip = extractor(r)
                 if ip and "." in ip:
-                    self.root.after(0, self._ip_var.set, ip)
+                    tag = f"  ({self._current.cc})" if self._current else ""
+                    self.root.after(0, self._ip_var.set, ip + tag)
                     self.root.after(0, self._dot.config, {"fg": C["green"]})
                     return
             except Exception:
                 continue
-
-        # All endpoints failed
-        label = "proxy unreachable" if self._current_proxy else "no internet?"
+        label = "proxy unreachable" if self._current else "no internet?"
         self.root.after(0, self._ip_var.set, label)
         self.root.after(0, self._dot.config, {"fg": C["red"]})
 
     def _disable_proxy_and_refresh(self):
-        disable_proxy()
-        self._current_proxy = None
+        SystemProxy.disable()
+        self._current = None
+        self._active_var.set("none")
         self._log("Proxy disabled — using direct connection.")
         self._refresh_ip_async()
 
-    # ── Rotation control ──────────────────────────────────────────────────────
+    # ── Custom list / export ──────────────────────────────────────────────────
+    def _load_custom(self):
+        path = filedialog.askopenfilename(
+            title="Load proxy list",
+            filetypes=[("Text/CSV", "*.txt *.csv"), ("All files", "*.*")])
+        if not path:
+            return
+        default = self._proto_var.get()
+        if default == "all":
+            default = "http"
+        entries = []
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    parsed = parse_proxy_line(line, default)
+                    if parsed:
+                        entries.append(parsed)
+        except Exception as e:
+            self._log(f"✗  Could not read list: {e}")
+            return
+        added = self._manager.add_custom(entries)
+        self._log(f"Loaded {added} custom proxies (default protocol: {default}). "
+                  f"They'll be tested and prioritised.")
+        if not self._running:
+            self._log("Tip: click Start Rotation to begin testing them.")
 
+    def _export_working(self):
+        with self._manager._lock:
+            pool = list(self._manager._pool)
+        if not pool:
+            self._log("Nothing to export yet — queue is empty.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt", initialfile="working_proxies.txt",
+            filetypes=[("Text", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# protocol://host:port  country  latency_ms\n")
+            for p in sorted(pool, key=lambda x: x.latency):
+                f.write(f"{p.protocol}://{p.addr}  {p.cc}  {p.latency}\n")
+        self._log(f"Exported {len(pool)} working proxies → {path}")
+
+    def _copy_active(self):
+        if not self._current:
+            self._log("No active proxy to copy.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(f"{self._current.protocol}://{self._current.addr}")
+        self._log("Active proxy copied to clipboard.")
+
+    # ── Rotation control ──────────────────────────────────────────────────────
     def _toggle(self):
-        if self._running:
-            self._stop()
-        else:
-            self._start()
+        self._stop() if self._running else self._start()
 
     def _start(self):
         self._running = True
+        self._on_filters_change()
         manual = self._interval_var.get() == "Manual"
         self._start_btn.config(text="■  Stop", bg=C["red"], fg="#1e1e2e")
         self._next_btn.config(state="normal")
         self._interval_cb.config(state="disabled")
-        mode_msg = "Manual mode — use '→ Next Proxy' to rotate." if manual else "Rotation started — background proxy fetcher running."
-        self._log(mode_msg)
+        self._log("Manual mode — use '→ Next Proxy' to rotate." if manual
+                  else "Rotation started — background fetcher running.")
         self._manager.start()
-        self._rotation_thread = threading.Thread(
-            target=self._rotation_loop, daemon=True, name="rotator")
+        self._rotation_thread = threading.Thread(target=self._rotation_loop,
+                                                 daemon=True, name="rotator")
         self._rotation_thread.start()
+        if self._health_var.get():
+            threading.Thread(target=self._health_loop, daemon=True,
+                             name="health").start()
 
     def _stop(self):
         self._running = False
@@ -883,127 +834,133 @@ class App:
         self._progress.stop()
         self._progress.config(mode="determinate")
         self._progress["value"] = 0
-        disable_proxy()
-        self._current_proxy = None
+        SystemProxy.disable()
+        self._current = None
+        self._active_var.set("none")
         self._log("Stopped — proxy disabled, direct connection restored.")
         self._refresh_ip_async()
 
-    def _apply_proxy(self, proxy: str):
-        host, port = proxy.rsplit(":", 1)
-        if enable_proxy(host, port):
-            self._current_proxy = proxy
-            self._log(f"→  Active proxy: {proxy}")
+    def _apply_proxy(self, proxy: Proxy):
+        host, port = proxy.addr.rsplit(":", 1)
+        # Strip any embedded credentials for the OS proxy host field.
+        host = host.split("@")[-1]
+        if SystemProxy.enable(host, port, proxy.protocol):
+            self._current = proxy
+            self._active_var.set(str(proxy))
+            self._log(f"→  Active: {proxy}")
             self._refresh_ip_async()
         else:
-            self._log(f"✗  Could not set proxy {proxy} (registry error)")
+            self._log(f"✗  Could not set proxy {proxy.addr}")
 
     def _force_rotate(self):
-        proxy = self._manager.get_next()
+        cc = self._selected_country()
+        proxy = self._manager.get_next(cc)
         if proxy:
             self._apply_proxy(proxy)
-            self.root.after(0, self._wait_var.set, "")
+            self._wait_var.set("")
         else:
-            self._log("No verified proxy in queue yet — still fetching…")
-
-    # ── Rotation loop (runs in background thread) ─────────────────────────────
+            where = "" if cc == "Any" else f" from {cc}"
+            self._log(f"No verified proxy{where} in queue yet — still fetching…")
 
     def _rotation_loop(self):
-        # First rotation immediately on start
         self._do_wait_and_rotate()
-
         while self._running:
             if self._interval_var.get() == "Manual":
-                # No auto-rotation — proxy stays until user clicks Next Proxy
                 self.root.after(0, self._cd_var.set,
-                                "Manual mode — click '→ Next Proxy' whenever you want to rotate")
+                                "Manual mode — click '→ Next Proxy' to rotate")
                 self.root.after(0, self._progress.__setitem__, "value", 0)
                 time.sleep(1)
                 continue
-
             interval = int(self._interval_var.get())
-
-            # Countdown
             for remaining in range(interval, 0, -1):
-                if not self._running:
-                    break
-                if self._interval_var.get() == "Manual":
+                if not self._running or self._interval_var.get() == "Manual":
                     break
                 pct = (1 - remaining / interval) * 100
                 self.root.after(0, self._set_countdown, remaining, pct)
                 time.sleep(1)
-
             if self._running and self._interval_var.get() != "Manual":
                 self._do_wait_and_rotate()
-
-        # Cleanup
         self.root.after(0, self._cd_var.set, "")
         self.root.after(0, self._wait_var.set, "")
         self.root.after(0, self._progress.__setitem__, "value", 0)
 
     def _do_wait_and_rotate(self):
-        """
-        Get the next proxy from the queue.
-        If empty, switch the progress bar to indeterminate and block here
-        until a proxy becomes available. Never skips a rotation.
-        """
-        proxy = self._manager.get_next()
-
+        cc = self._selected_country()
+        proxy = self._manager.get_next(cc)
         if proxy is None:
-            self._log("Timer fired — no proxy ready yet, waiting…")
-            self.root.after(0, self._wait_var.set, "⏳ waiting for proxy…")
+            where = "" if cc == "Any" else f" ({cc})"
+            self._log(f"Timer fired — no proxy{where} ready, waiting…")
+            self.root.after(0, self._wait_var.set, f"⏳ waiting for proxy{where}…")
             self.root.after(0, self._cd_var.set, "Holding — waiting for a verified proxy…")
             self.root.after(0, self._progress.config, {"mode": "indeterminate"})
             self.root.after(0, self._progress.start, 12)
-
             while self._running:
-                proxy = self._manager.get_next()
+                proxy = self._manager.get_next(self._selected_country())
                 if proxy:
                     break
                 time.sleep(0.5)
-
             self.root.after(0, self._progress.stop)
             self.root.after(0, self._progress.config, {"mode": "determinate"})
             self.root.after(0, self._wait_var.set, "")
-
         if proxy and self._running:
             self._apply_proxy(proxy)
 
-    def _set_countdown(self, remaining: int, pct: float):
+    def _set_countdown(self, remaining, pct):
         self._cd_var.set(f"Next rotation in {remaining}s")
         self._progress["value"] = pct
 
-    # ── Style ──────────────────────────────────────────────────────────────────
+    def _health_loop(self):
+        """Periodically verify the active proxy still works; rotate if it dies."""
+        while self._running:
+            for _ in range(HEALTH_INTERVAL):
+                if not self._running:
+                    return
+                time.sleep(1)
+            if not self._health_var.get() or not self._current:
+                continue
+            try:
+                r = requests.get(GEO_TEST_URL, proxies=self._current.requests_dict(),
+                                 timeout=TEST_TIMEOUT)
+                ok = r.status_code == 200 and r.json().get("status") == "success"
+            except Exception:
+                ok = False
+            if not ok and self._running:
+                self.root.after(0, self._log,
+                                f"⚠  Active proxy {self._current.addr} failed health check — rotating.")
+                self._do_wait_and_rotate()
 
+    # ── Style ─────────────────────────────────────────────────────────────────
     def _apply_style(self):
         s = ttk.Style()
-        s.theme_use("clam")
-        s.configure("TNotebook",        background=C["bg"],    borderwidth=0)
-        s.configure("TNotebook.Tab",    background=C["panel"], foreground=C["dim"],
-                    padding=[12, 5],    font=("Segoe UI", 9))
-        s.map("TNotebook.Tab",
-              background=[("selected", C["blue"])],
+        try:
+            s.theme_use("clam")
+        except tk.TclError:
+            pass
+        s.configure("TNotebook", background=C["bg"], borderwidth=0)
+        s.configure("TNotebook.Tab", background=C["panel"], foreground=C["dim"],
+                    padding=[12, 5], font=("Segoe UI", 9))
+        s.map("TNotebook.Tab", background=[("selected", C["blue"])],
               foreground=[("selected", "#1e1e2e")])
-        s.configure("TCombobox",
-                    fieldbackground=C["panel"], background=C["panel"],
+        s.configure("TCombobox", fieldbackground=C["panel"], background=C["panel"],
                     foreground=C["text"], selectbackground=C["panel"],
                     selectforeground=C["text"])
-        s.configure("TProgressbar",
-                    troughcolor=C["panel"], background=C["blue"], borderwidth=0)
-        s.configure("TScrollbar",
-                    background=C["muted"], troughcolor=C["bg"], borderwidth=0)
+        s.configure("TProgressbar", troughcolor=C["panel"], background=C["blue"],
+                    borderwidth=0)
+        s.configure("TScrollbar", background=C["muted"], troughcolor=C["bg"],
+                    borderwidth=0)
 
     # ── Entry point ───────────────────────────────────────────────────────────
-
     def _on_close(self):
         self._running = False
         self._manager.stop()
-        disable_proxy()
+        SystemProxy.disable()
         self.root.destroy()
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_ip_async()
-        self._log("Ready. Click 'Start Rotation' — proxy fetcher starts automatically.")
+        self._log(f"Ready on {_SYS}. {SystemProxy.platform_note()}")
+        self._log("Click 'Start Rotation' — the proxy fetcher starts automatically.")
         self.root.mainloop()
 
 

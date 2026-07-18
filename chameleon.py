@@ -25,6 +25,7 @@ browser profile (Multilogin / AdsPower / GoLogin).
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
 import threading
+import queue
 import platform
 import subprocess
 import time
@@ -64,8 +65,11 @@ PROXY_SOURCES = [
 
 # Step-1 test: proxy's own IP + geolocation (returns the country fields we need).
 GEO_TEST_URL       = "http://ip-api.com/json/?fields=status,country,countryCode,query"
-# Step-2 test: prove the proxy reaches a real site, not just whitelisted APIs.
-SECONDARY_TEST_URL = "http://example.com"
+# Step-2 test: prove the proxy can open an HTTPS CONNECT tunnel — the exact
+# thing a browser needs. Plain-HTTP proxies that pass step 1 but can't tunnel
+# HTTPS are what cause ERR_TUNNEL_CONNECTION_FAILED in the browser, so this
+# step is deliberately an https:// URL to filter them out.
+SECONDARY_TEST_URL = "https://www.google.com/generate_204"
 
 TEST_TIMEOUT    = 7      # seconds per proxy test
 TEST_WORKERS    = 16     # concurrent test threads
@@ -73,6 +77,16 @@ QUEUE_LOW_MARK  = 8      # refetch when queue drops below this
 QUEUE_HIGH_MARK = 40     # stop testing when queue reaches this
 MAX_TEST_BATCH  = 400    # proxies tested per fetch cycle
 HEALTH_INTERVAL = 20     # seconds between active-proxy health checks
+
+# All of the app's own outbound requests (fetching proxy lists, validating
+# proxies, IP checks, health checks) go through this session. trust_env=False
+# makes it ignore any ambient/system proxy env vars (HTTP_PROXY, ALL_PROXY,
+# GNOME/desktop-exported proxies). Otherwise, if the OS session already has a
+# proxy configured — including a stale/dead one left by a previous run — every
+# source fetch would be tunnelled through it and return nothing ("Fetched 0").
+# Explicit per-request `proxies=` still applies (that's how we test proxies).
+HTTP = requests.Session()
+HTTP.trust_env = False
 
 # HTTP-only IP-check endpoints, tried in order until one responds.
 IP_CHECK_ENDPOINTS = [
@@ -328,17 +342,20 @@ class ProxyManager:
             if pf == "all" or pf == proto:
                 raw.append((addr, proto))
 
+        errors: list[str] = []
+        sources_ok = 0
         for url, proto in self._sources():
             if not self._active:
                 return
             try:
-                r = requests.get(url, timeout=14)
+                r = HTTP.get(url, timeout=14)
+                sources_ok += 1
                 for line in r.text.splitlines():
                     line = line.strip()
                     if ":" in line and len(line) < 24 and " " not in line:
                         raw.append((line, proto))
-            except Exception:
-                pass
+            except Exception as e:
+                errors.append(type(e).__name__)
 
         with self._seen_lock:
             custom_addrs = {a for a, _ in self._custom}
@@ -346,6 +363,11 @@ class ProxyManager:
         random.shuffle(new)
         batch = new[:MAX_TEST_BATCH]
         self._log(f"Fetched {len(raw)} candidates — testing {len(batch)}…")
+        if not raw and errors:
+            uniq = ", ".join(sorted(set(errors)))
+            self._log(f"⚠  Could not reach any proxy source ({sources_ok} ok, "
+                      f"{len(errors)} failed: {uniq}). Check your internet / "
+                      f"disable any system VPN or proxy, then it'll retry.")
 
         for addr, proto in batch:
             if not self._active or self.ready >= QUEUE_HIGH_MARK:
@@ -362,7 +384,7 @@ class ProxyManager:
             p = proxy.requests_dict()
             try:
                 t0 = time.time()
-                r = requests.get(GEO_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
+                r = HTTP.get(GEO_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
                 latency = int((time.time() - t0) * 1000)
                 if r.status_code != 200:
                     return
@@ -372,10 +394,18 @@ class ProxyManager:
                 ip = data.get("query", "")
                 if not ip or "." not in ip:
                     return
+                # Early reject on the cheap HTTP hop before paying for the tunnel.
                 if self.max_latency and latency > self.max_latency:
                     return
-                r2 = requests.get(SECONDARY_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
-                if r2.status_code not in (200, 301, 302):
+                t1 = time.time()
+                r2 = HTTP.get(SECONDARY_TEST_URL, proxies=p, timeout=TEST_TIMEOUT)
+                if r2.status_code not in (200, 204, 301, 302):
+                    return
+                # Browsing is HTTPS, so the tunnel hop is the honest speed
+                # measure — keep the slower of the two so the cap means what
+                # the user expects.
+                latency = max(latency, int((time.time() - t1) * 1000))
+                if self.max_latency and latency > self.max_latency:
                     return
                 proxy.cc      = data.get("countryCode") or "??"
                 proxy.country = data.get("country") or "Unknown"
@@ -444,13 +474,16 @@ class App:
         self._rotations = 0
         self._sel_country_code = "Any"
 
+        self._ui_queue: queue.Queue = queue.Queue()
+
         self._manager = ProxyManager(
-            on_log    = lambda msg: self.root.after(0, self._log, msg),
-            on_change = lambda: self.root.after(0, self._refresh_status),
+            on_log    = lambda msg: self._ui(self._log, msg),
+            on_change = lambda: self._ui(self._refresh_status),
         )
 
         self._apply_style()
         self._build_ui()
+        self.root.after(100, self._drain_ui_queue)
         self.root.after(1200, self._tick_status)
 
     # ── Small UI helpers ──────────────────────────────────────────────────────
@@ -577,8 +610,11 @@ class App:
 
         tk.Label(r1, text="Max latency", bg=C["surface"], fg=C["dim"],
                  font=F["body"]).pack(side="left", padx=(18, 0))
-        self._lat_var = tk.StringVar(value="Any")
-        self._combo(r1, self._lat_var, ["Any", "1000", "2000", "3000", "5000"], 7,
+        # Default to a real cap: proxies slower than ~2.5 s are effectively
+        # unusable for browsing (pages hang / time out), so don't queue them
+        # unless the user deliberately widens this to "Any".
+        self._lat_var = tk.StringVar(value="2500")
+        self._combo(r1, self._lat_var, ["1000", "1500", "2000", "2500", "3000", "5000", "Any"], 7,
                     self._on_filters_change).pack(side="left", padx=6)
         tk.Label(r1, text="ms", bg=C["surface"], fg=C["hint"],
                  font=F["small"]).pack(side="left")
@@ -677,7 +713,37 @@ class App:
         return self._sel_country_code
 
     # ── Logging ───────────────────────────────────────────────────────────────
+    def _ui(self, fn, *args):
+        """Run a Tk-touching callable on the main thread.
+
+        Tkinter is not thread-safe; calling widget methods from a background
+        thread segfaults the whole process on Linux. Worse, on some Tk builds
+        (e.g. the one uv ships on Linux) `root.after` from a background thread
+        silently drops the callback. So marshal through a queue that the main
+        thread drains on a short timer — the only mechanism that works
+        everywhere.
+        """
+        if threading.current_thread() is threading.main_thread():
+            fn(*args)
+        else:
+            self._ui_queue.put((fn, args))
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn, args = self._ui_queue.get_nowait()
+                try:
+                    fn(*args)
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        self.root.after(100, self._drain_ui_queue)
+
     def _log(self, text):
+        self._ui(self._log_impl, text)
+
+    def _log_impl(self, text):
         ts = datetime.now().strftime("%H:%M:%S")
         self._log_widget.config(state="normal")
         self._log_widget.insert("end", f"[{ts}] {text}\n")
@@ -699,18 +765,18 @@ class App:
             kw["proxies"] = self._current.requests_dict()
         for url, extractor in IP_CHECK_ENDPOINTS:
             try:
-                r = requests.get(url, timeout=10, **kw)
+                r = HTTP.get(url, timeout=10, **kw)
                 ip = extractor(r)
                 if ip and "." in ip:
                     tag = f"   {self._current.cc}" if self._current else ""
-                    self.root.after(0, self._ip_var.set, ip + tag)
-                    self.root.after(0, self._dot.config, {"fg": C["green"]})
+                    self._ui(self._ip_var.set, ip + tag)
+                    self._ui(self._dot.config, {"fg": C["green"]})
                     return
             except Exception:
                 continue
         label = "proxy unreachable" if self._current else "no internet?"
-        self.root.after(0, self._ip_var.set, label)
-        self.root.after(0, self._dot.config, {"fg": C["red"]})
+        self._ui(self._ip_var.set, label)
+        self._ui(self._dot.config, {"fg": C["red"]})
 
     def _disable_proxy_and_refresh(self):
         SystemProxy.disable()
@@ -810,7 +876,7 @@ class App:
         if SystemProxy.enable(host, port, proxy.protocol):
             self._current = proxy
             self._rotations += 1
-            self._active_var.set(f"Proxy: {proxy}")
+            self._ui(self._active_var.set, f"Proxy: {proxy}")
             self._log(f"→  Active: {proxy}")
             self._refresh_ip_async()
         else:
@@ -830,9 +896,9 @@ class App:
         self._do_wait_and_rotate()
         while self._running:
             if self._interval_var.get() == "Manual":
-                self.root.after(0, self._cd_var.set,
+                self._ui(self._cd_var.set,
                                 "Manual mode — click '→ Next Proxy' to rotate")
-                self.root.after(0, self._progress.__setitem__, "value", 0)
+                self._ui(self._progress.__setitem__, "value", 0)
                 time.sleep(1)
                 continue
             interval = int(self._interval_var.get())
@@ -840,13 +906,13 @@ class App:
                 if not self._running or self._interval_var.get() == "Manual":
                     break
                 pct = (1 - remaining / interval) * 100
-                self.root.after(0, self._set_countdown, remaining, pct)
+                self._ui(self._set_countdown, remaining, pct)
                 time.sleep(1)
             if self._running and self._interval_var.get() != "Manual":
                 self._do_wait_and_rotate()
-        self.root.after(0, self._cd_var.set, "")
-        self.root.after(0, self._wait_var.set, "")
-        self.root.after(0, self._progress.__setitem__, "value", 0)
+        self._ui(self._cd_var.set, "")
+        self._ui(self._wait_var.set, "")
+        self._ui(self._progress.__setitem__, "value", 0)
 
     def _do_wait_and_rotate(self):
         cc = self._selected_country()
@@ -854,18 +920,18 @@ class App:
         if proxy is None:
             where = "" if cc == "Any" else f" ({cc})"
             self._log(f"Timer fired — no proxy{where} ready, waiting…")
-            self.root.after(0, self._wait_var.set, f"⏳ waiting for proxy{where}…")
-            self.root.after(0, self._cd_var.set, "Holding — waiting for a verified proxy…")
-            self.root.after(0, self._progress.config, {"mode": "indeterminate"})
-            self.root.after(0, self._progress.start, 12)
+            self._ui(self._wait_var.set, f"⏳ waiting for proxy{where}…")
+            self._ui(self._cd_var.set, "Holding — waiting for a verified proxy…")
+            self._ui(self._progress.config, {"mode": "indeterminate"})
+            self._ui(self._progress.start, 12)
             while self._running:
                 proxy = self._manager.get_next(self._selected_country())
                 if proxy:
                     break
                 time.sleep(0.5)
-            self.root.after(0, self._progress.stop)
-            self.root.after(0, self._progress.config, {"mode": "determinate"})
-            self.root.after(0, self._wait_var.set, "")
+            self._ui(self._progress.stop)
+            self._ui(self._progress.config, {"mode": "determinate"})
+            self._ui(self._wait_var.set, "")
         if proxy and self._running:
             self._apply_proxy(proxy)
 
@@ -882,13 +948,13 @@ class App:
             if not self._health_var.get() or not self._current:
                 continue
             try:
-                r = requests.get(GEO_TEST_URL, proxies=self._current.requests_dict(),
+                r = HTTP.get(GEO_TEST_URL, proxies=self._current.requests_dict(),
                                  timeout=TEST_TIMEOUT)
                 ok = r.status_code == 200 and r.json().get("status") == "success"
             except Exception:
                 ok = False
             if not ok and self._running:
-                self.root.after(0, self._log,
+                self._ui(self._log,
                                 f"⚠  Active proxy {self._current.addr} failed health check — rotating.")
                 self._do_wait_and_rotate()
 

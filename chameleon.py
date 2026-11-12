@@ -24,6 +24,7 @@ browser profile (Multilogin / AdsPower / GoLogin).
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, filedialog
+import csv
 import threading
 import queue
 import platform
@@ -31,7 +32,18 @@ import subprocess
 import time
 from datetime import datetime
 
-from proxy_pool import Proxy, ProxyManager, check_connection, parse_proxy_line
+from proxy_pool import (
+    BUILTIN_FEEDS,
+    PROTOCOLS,
+    SOURCE_NAMES,
+    TEST_TIMEOUT,
+    Proxy,
+    ProxyManager,
+    check_connection,
+    country_codes,
+    read_proxy_list,
+    verify_destination,
+)
 
 # ── Platform detection & guarded imports ──────────────────────────────────────
 
@@ -45,6 +57,12 @@ if IS_WINDOWS:
     import ctypes
 
 HEALTH_INTERVAL = 20
+SOURCE_OPTIONS = {
+    "All public": SOURCE_NAMES,
+    "Live API": ("proxyscrape-api",),
+    "Text feeds": tuple(BUILTIN_FEEDS),
+    "Imported only": (),
+}
 
 
 # ── Colour palette & fonts ─────────────────────────────────────────────────────
@@ -189,7 +207,7 @@ class App:
         self._running = False
         self._current: Proxy | None = None
         self._rotations = 0
-        self._sel_country_code = "Any"
+        self._selected_countries = frozenset()
         self._rotation_due = None
         self._interval = 0
         self._health_in_flight = False
@@ -329,7 +347,7 @@ class App:
         tk.Label(r1, text="Protocol", bg=C["surface"], fg=C["dim"],
                  font=F["body"]).pack(side="left", padx=(18, 0))
         self._proto_var = tk.StringVar(value="all")
-        self._combo(r1, self._proto_var, ["all", "http", "socks4", "socks5"], 7,
+        self._combo(r1, self._proto_var, ["all", *PROTOCOLS], 7,
                     self._on_filters_change).pack(side="left", padx=6)
 
         tk.Label(r1, text="Max latency", bg=C["surface"], fg=C["dim"],
@@ -345,18 +363,35 @@ class App:
 
         r2 = tk.Frame(body, bg=C["surface"])
         r2.pack(fill="x")
-        tk.Label(r2, text="Country for next proxy", bg=C["surface"], fg=C["mauve"],
+        tk.Label(r2, text="Exit countries", bg=C["surface"], fg=C["mauve"],
                  font=F["h2"]).pack(side="left")
         self._country_var = tk.StringVar(value="Any")
-        self._country_cb = self._combo(r2, self._country_var, ["Any"], 26,
+        self._country_cb = self._combo(r2, self._country_var, ["Any"], 14,
                                        self._on_filters_change)
+        self._country_cb.config(state="normal")
+        self._country_cb.bind("<Return>", self._on_filters_change)
         self._country_cb.pack(side="left", padx=8)
+        self._btn(r2, "Apply", self._on_filters_change, padx=8, pady=2).pack(side="left")
 
         self._health_var = tk.BooleanVar(value=True)
         tk.Checkbutton(r2, text="Auto-recheck active proxy", variable=self._health_var,
                        bg=C["surface"], fg=C["dim"], selectcolor=C["panel"],
                        activebackground=C["surface"], activeforeground=C["text"],
                        font=F["body"], bd=0, highlightthickness=0).pack(side="right")
+
+        r3 = tk.Frame(body, bg=C["surface"])
+        r3.pack(fill="x", pady=(8, 0))
+        tk.Label(r3, text="Sources", bg=C["surface"], fg=C["dim"],
+                 font=F["body"]).pack(side="left")
+        self._source_var = tk.StringVar(value="All public")
+        self._combo(r3, self._source_var, list(SOURCE_OPTIONS), 15,
+                    self._on_filters_change).pack(side="left", padx=8)
+        self._dual_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(r3, text="Verify two HTTPS sites", variable=self._dual_var,
+                       command=self._on_filters_change, bg=C["surface"], fg=C["dim"],
+                       selectcolor=C["panel"], activebackground=C["surface"],
+                       activeforeground=C["text"], font=F["body"], bd=0,
+                       highlightthickness=0).pack(side="right")
 
     # ── Action row + countdown ────────────────────────────────────────────────
     def _build_action_row(self, parent):
@@ -401,9 +436,15 @@ class App:
     # ── Filters ───────────────────────────────────────────────────────────────
     def _on_filters_change(self, _evt=None):
         lat = self._lat_var.get()
-        self._sel_country_code = self._country_var.get().split()[0]
+        try:
+            self._selected_countries = country_codes(self._country_var.get())
+        except ValueError as exc:
+            self._log(str(exc))
+            self._country_var.set(", ".join(sorted(self._selected_countries)) or "Any")
         self._manager.configure(self._proto_var.get(), 0 if lat == "Any" else int(lat),
-                                self._sel_country_code)
+                                self._selected_countries,
+                                sources=SOURCE_OPTIONS[self._source_var.get()],
+                                verify_site=self._dual_var.get())
         self._refresh_status()
 
     # ── Status refresh ────────────────────────────────────────────────────────
@@ -421,11 +462,7 @@ class App:
         else:
             self._countries_var.set("No countries discovered yet")
 
-        if self._sel_country_code != "Any":
-            counts.setdefault(self._sel_country_code, 0)
-        values = {cc: f"{cc}  ({n})" for cc, n in counts.most_common()}
-        self._country_cb["values"] = ["Any", *values.values()]
-        self._country_var.set(values.get(self._sel_country_code, "Any"))
+        self._country_cb["values"] = ["Any", *sorted(cc for cc in counts if cc != "??")]
 
     def _tick_status(self):
         self._refresh_status()
@@ -514,20 +551,15 @@ class App:
     def _load_custom(self):
         path = filedialog.askopenfilename(
             title="Load proxy list",
-            filetypes=[("Text/CSV", "*.txt *.csv"), ("All files", "*.*")])
+            filetypes=[("Proxy lists", "*.txt *.csv *.json"), ("All files", "*.*")])
         if not path:
             return
         default = self._proto_var.get()
         if default == "all":
             default = "http"
-        entries = []
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    parsed = parse_proxy_line(line, default)
-                    if parsed:
-                        entries.append(parsed)
-        except Exception as e:
+            entries = read_proxy_list(path, default)
+        except (OSError, ValueError, csv.Error) as e:
             self._log(f"✗  Could not read list: {e}")
             return
         added = self._manager.add_custom(entries)
@@ -537,7 +569,8 @@ class App:
             self._log("Tip: click Start to begin testing them.")
 
     def _export_working(self):
-        pool = self._manager.snapshot()
+        pool = [proxy for proxy in self._manager.snapshot()
+                if not self._selected_countries or proxy.cc in self._selected_countries]
         if not pool:
             self._log("Nothing to export yet — queue is empty.")
             return
@@ -548,7 +581,7 @@ class App:
             return
         with open(path, "w", encoding="utf-8") as f:
             f.write("# protocol://host:port  country  latency_ms\n")
-            for p in sorted(pool, key=lambda x: x.latency):
+            for p in pool:
                 f.write(f"{p.url}  {p.cc}  {p.latency}\n")
         self._log(f"Exported {len(pool)} working proxies → {path}")
 
@@ -614,11 +647,13 @@ class App:
 
     def _force_rotate(self):
         if not self._try_rotate():
-            where = "" if self._sel_country_code == "Any" else f" from {self._sel_country_code}"
+            countries = ", ".join(sorted(self._selected_countries))
+            where = f" from {countries}" if countries else ""
             self._log(f"No usable proxy{where} ready yet — discovery is running.")
 
     def _try_rotate(self):
-        proxy = self._manager.get_next(self._sel_country_code)
+        previous_ip = self._current.ip if self._current else None
+        proxy = self._manager.get_next(self._selected_countries, previous_ip)
         if proxy is None or not self._apply_proxy(proxy):
             return False
         self._rotation_due = time.monotonic() + self._interval if self._interval else None
@@ -634,7 +669,8 @@ class App:
                 remaining = self._rotation_due - now
                 if remaining <= 0:
                     if not self._try_rotate():
-                        where = "" if self._sel_country_code == "Any" else f" ({self._sel_country_code})"
+                        countries = ", ".join(sorted(self._selected_countries))
+                        where = f" ({countries})" if countries else ""
                         self._wait_var.set(f"Waiting for a verified proxy{where}…")
                         self._cd_var.set("")
                         self._progress["value"] = 0
@@ -644,12 +680,15 @@ class App:
             if (self._current and self._health_var.get() and not self._health_in_flight
                     and now >= self._next_health_check):
                 self._health_in_flight = True
-                threading.Thread(target=self._check_active, args=(self._current,),
+                threading.Thread(target=self._check_active, args=(self._current, self._dual_var.get()),
                                  daemon=True).start()
         self.root.after(250, self._tick_rotation)
 
-    def _check_active(self, proxy):
-        self._ui(self._finish_health_check, proxy, check_connection(proxy))
+    def _check_active(self, proxy, dual):
+        result = check_connection(proxy)
+        if result and dual and verify_destination(proxy, TEST_TIMEOUT) is None:
+            result = None
+        self._ui(self._finish_health_check, proxy, result)
 
     def _finish_health_check(self, proxy, result):
         self._health_in_flight = False
@@ -661,6 +700,7 @@ class App:
             self._clear_active_proxy()
             self._rotation_due = time.monotonic()
         elif result:
+            proxy.ip = result[0]
             self._ip_request += 1
             self._show_ip(self._ip_request, proxy, result)
 

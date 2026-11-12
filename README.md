@@ -1,8 +1,8 @@
 # Chameleon
 
 Chameleon finds free HTTP, SOCKS4, and SOCKS5 proxies, verifies them from your
-machine, and ranks them by measured latency. Use the CLI to build a fresh list
-or the desktop app to rotate the system proxy manually or on a timer.
+machine, and ranks them by measured latency. The Python desktop dashboard
+lets you scan, filter, copy, export, and apply verified proxies.
 
 ## Quick start
 
@@ -12,16 +12,52 @@ Install Python 3.10 or newer, then run:
 git clone https://github.com/chentaymane/Chameleon.git
 cd Chameleon
 python -m pip install -r requirements.txt
-python find_proxies.py
+python chameleon.py
 ```
 
-Run `python chameleon.py` to open the desktop app. It requires Tkinter, which
+The dashboard requires Tkinter, which
 comes with the standard Windows and macOS Python installers. On Linux, install
 your distribution's Tkinter package if needed, such as `python3-tk` on Ubuntu
 or `python3-tkinter` on Fedora. Windows can also use `run.bat`; Linux and macOS
 can use `bash run.sh`.
 
-## Find proxies from the CLI
+## Use the dashboard
+
+1. Choose one or more proxy types, a latency cap, and a source group. Enter
+   countries such as `US, DE` in **Exit countries** and press Enter or click
+   **Apply**. Use `Any` to allow all countries.
+2. Click **Find proxies** to scan. Scanning leaves your system proxy alone.
+   The **Verified proxies** table shows the endpoint, type, exit country,
+   exit IP, latency, and whether the endpoint came from an imported file.
+3. Select a result and click **Copy selected** to get its proxy URL or
+   **Use selected** to apply it to the system. **Next proxy** picks the
+   next matching result. **Export** saves the current results to a text file.
+4. To rotate automatically, choose an interval and click **Start rotation**.
+   **Stop rotation** pauses the timer while scanning continues. **Stop scan**
+   stops discovery and the rotation timer. Use **Disable proxy** to clear
+   the active system proxy. Closing Chameleon also clears the proxy it applied.
+
+Use **Load list** for local text, CSV, or JSON files and **Add feed** for an HTTPS
+text feed. Prefix a feed with `http=`, `socks4=`, or `socks5=` if it lists bare
+addresses. **Imported only** skips the built-in providers and uses the files
+and feeds you added. Open **Activity** for feed counts and status messages.
+
+**Auto-recheck active proxy** tests the active route about every 20 seconds.
+On failure, it clears the route and looks for a replacement if timed rotation
+is enabled.
+
+| OS | System settings used |
+| --- | --- |
+| Windows | WinINET settings |
+| Linux | GNOME `gsettings` |
+| macOS | `networksetup` |
+
+System proxy support depends on the OS and the application using it.
+Authenticated proxies can be copied into applications that support credentials.
+Text inputs accept `host:port`, `socks5://host:port`,
+`host:port:user:password`, and `http://user:password@host:port`.
+
+## Optional command-line finder
 
 ```sh
 # Find up to 15 distinct exits in the US, Germany, or France.
@@ -53,31 +89,6 @@ python find_proxies.py --no-public --input proxies.json --feed socks5=https://ex
 Run `python find_proxies.py --help` for the full argument list. Progress goes
 to stderr. Exit code 0 means at least one match, 1 means no matches, and 2
 means invalid arguments or an unreadable input file.
-
-## Desktop app
-
-1. Set **Sources** to all public sources, the live API, text feeds, or imported
-   lists only. Use **Load list** to add a text, CSV, or JSON list.
-2. Choose the protocol and latency cap. Enter countries such as `US, DE` in
-   **Exit countries** and click **Apply** or press Enter. Choose `Any` to allow
-   all countries.
-3. Click **Start**. Choose **Manual** to rotate with **Next Proxy**, or choose
-   an interval to rotate automatically. **Auto-recheck active proxy** checks
-   the active route about every 20 seconds and looks for a replacement if it
-   fails.
-4. **Export** saves matching ready proxies as text. **Stop** or **Disable**
-   turns off the system proxy Chameleon applied.
-
-| OS | System settings used |
-| --- | --- |
-| Windows | WinINET settings |
-| Linux | GNOME `gsettings` |
-| macOS | `networksetup` |
-
-System proxy support depends on the OS and the application using it. Use
-**Copy** to configure an application directly. Authenticated imports use the
-copy workflow. Text inputs accept `host:port`, `socks5://host:port`,
-`host:port:user:password`, and `http://user:password@host:port`.
 
 ## Sources and ranking
 

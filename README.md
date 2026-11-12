@@ -6,20 +6,23 @@ lets you scan, filter, copy, export, and apply verified proxies.
 
 ## Quick start
 
-Install Python 3.10 or newer, then run:
+Install Python 3.10 or newer with Tkinter, then clone the repository:
 
 ```sh
 git clone https://github.com/chentaymane/Chameleon.git
 cd Chameleon
-python -m pip install -r requirements.txt
-python chameleon.py
 ```
 
-The dashboard requires Tkinter, which
-comes with the standard Windows and macOS Python installers. On Linux, install
-your distribution's Tkinter package if needed, such as `python3-tk` on Ubuntu
-or `python3-tkinter` on Fedora. Windows can also use `run.bat`; Linux and macOS
-can use `bash run.sh`.
+- **Windows:** Run `run.bat`. The official Python installer includes Tcl/Tk by
+  default. The launcher can use the Windows `py` launcher or Python on PATH.
+- **Linux:** Run `bash run.sh` from a graphical session. On Debian and Ubuntu,
+  install the prerequisites with `sudo apt install python3 python3-tk python3-venv`.
+  Fedora provides Tkinter as `python3-tkinter`.
+- **macOS:** Run `bash run.sh` with a Python installation that includes Tkinter.
+
+The launchers create a project-local environment and install the Python
+dependencies on first use. To use your own environment, install
+`python -m pip install -r requirements.txt` and run `python chameleon.py`.
 
 ## Use the dashboard
 
@@ -35,7 +38,8 @@ can use `bash run.sh`.
 4. To rotate automatically, choose an interval and click **Start rotation**.
    **Stop rotation** pauses the timer while scanning continues. **Stop scan**
    stops discovery and the rotation timer. Use **Disable proxy** to clear
-   the active system proxy. Closing Chameleon also clears the proxy it applied.
+   the active proxy. On Windows and GNOME-compatible Linux sessions,
+   disabling the proxy or closing Chameleon restores your previous settings.
 
 Use **Load list** for local text, CSV, or JSON files and **Add feed** for an HTTPS
 text feed. Prefix a feed with `http=`, `socks4=`, or `socks5=` if it lists bare
@@ -46,13 +50,14 @@ and feeds you added. Open **Activity** for feed counts and status messages.
 On failure, it clears the route and looks for a replacement if timed rotation
 is enabled.
 
-| OS | System settings used |
+| Desktop | **Use selected** and timed rotation |
 | --- | --- |
-| Windows | WinINET settings |
-| Linux | GNOME `gsettings` |
-| macOS | `networksetup` |
+| Windows | HTTP and SOCKS4 through WinINET. Use **Copy selected** for SOCKS5. |
+| GNOME-compatible Linux | HTTP and SOCKS5 through GSettings. Use **Copy selected** for SOCKS4. |
+| KDE Plasma | Scan, filter, export, and copy. Set the proxy in your browser or application. |
+| macOS | System settings through `networksetup`. |
 
-System proxy support depends on the OS and the application using it.
+Applications must support the desktop's proxy settings to use them.
 Authenticated proxies can be copied into applications that support credentials.
 Text inputs accept `host:port`, `socks5://host:port`,
 `host:port:user:password`, and `http://user:password@host:port`.

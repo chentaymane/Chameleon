@@ -1,10 +1,16 @@
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event
 import time
 import unittest
 from unittest.mock import patch
 
 import proxy_pool as pool
+import find_proxies
 
 
 class ProxyPoolTests(unittest.TestCase):
@@ -33,7 +39,7 @@ http://1.1.1.1:80
 socks5://1.1.1.1:80
 """
         with patch.object(pool, "get_text", return_value=content):
-            self.assertEqual(pool.fetch_source("feed"), [
+            self.assertEqual(pool.fetch_source(pool.Feed("test", "https://example.org")), [
                 ("1.1.1.1:80", "http"), ("1.1.1.1:80", "socks5"),
             ])
 
@@ -49,7 +55,7 @@ socks5://1.1.1.1:80
                 self.assertIsNone(pool.check_connection(proxy))
 
     def test_scan_caps_queue_and_prioritizes_selected_country_and_fastest_results(self):
-        manager = pool.ProxyManager(lambda _: None, lambda: None)
+        manager = pool.ProxyManager(lambda _: None, lambda: None, verify_site=False)
         manager.configure("http", 2500, "FR")
         entries = [(f"8.8.8.{i}:80", "http") for i in range(1, 70)]
         entries.append(("8.8.4.4:1080", "socks5"))
@@ -73,7 +79,7 @@ socks5://1.1.1.1:80
             self.assertEqual(manager.snapshot(), [])
 
     def test_consumed_proxy_can_be_rechecked_after_cooldown(self):
-        manager = pool.ProxyManager(lambda _: None, lambda: None)
+        manager = pool.ProxyManager(lambda _: None, lambda: None, verify_site=False)
         entry = ("8.8.8.8:80", "http")
         with patch.object(pool, "fetch_source", return_value=[entry]), \
                 patch.object(pool, "check_connection", return_value=("1.1.1.1", "US", 40)), \
@@ -87,6 +93,60 @@ socks5://1.1.1.1:80
                 manager.scan(workers, Event())
                 self.assertIsNotNone(manager.get_next())
             self.assertEqual(manager.tested_total, 2)
+
+    def test_targeted_feeds_and_other_protocols_share_the_scan_budget(self):
+        manager = pool.ProxyManager(lambda _: None, lambda: None,
+                                    sources=("proxyscrape-api", "monosans"), workers=1,
+                                    verify_site=False)
+        manager.configure("all", 0, "US, DE")
+        entries = {
+            "proxyscrape-api/DE": [("8.8.8.1:80", "http"), ("8.8.8.2:80", "http")],
+            "proxyscrape-api/US": [("8.8.8.3:80", "http")],
+            "monosans": [("8.8.8.4:80", "http"), ("8.8.8.5:1080", "socks5")],
+        }
+        checked = []
+
+        def fetch(feed):
+            if feed.name.startswith("proxyscrape-api/"):
+                self.assertIn("country=" + feed.name[-2:].lower(), feed.url)
+            return entries[feed.name]
+
+        def check(proxy, _timeout):
+            checked.append(proxy.endpoint)
+            return None
+
+        with patch.object(pool, "fetch_source", side_effect=fetch), \
+                patch.object(pool, "check_connection", side_effect=check), \
+                ThreadPoolExecutor(max_workers=1) as workers:
+            manager.scan(workers, Event(), budget=4)
+        self.assertEqual(checked, ["8.8.8.1:80", "8.8.8.4:80", "8.8.8.3:80", "8.8.8.5:1080"])
+
+    def test_cli_import_only_enforces_dual_check_country_and_unique_exits(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "proxies.csv"
+            path.write_text("proxy,country\nhttp://1.1.1.1:80,US\n"
+                            "socks5://1.1.1.2:1080,DE\nhttp://1.1.1.3:80,US\n"
+                            "http://1.1.1.4:80,GB\n", encoding="utf-8")
+            output = StringIO()
+            traces = {
+                "1.1.1.1:80": ("8.8.8.8", "US", 100),
+                "1.1.1.2:1080": ("8.8.8.8", "US", 20),
+                "1.1.1.3:80": ("8.8.4.4", "DE", 10),
+                "1.1.1.4:80": ("1.0.0.1", "GB", 15),
+            }
+            with patch.object(pool, "check_connection",
+                              side_effect=lambda proxy, _: traces[proxy.endpoint]), \
+                    patch.object(pool, "verify_destination",
+                                 side_effect=lambda proxy, _: None if proxy.cc == "DE" else 40), \
+                    redirect_stdout(output), redirect_stderr(StringIO()):
+                status = find_proxies.main(["--no-public", "--input", str(path), "--format", "json",
+                                            "--country", "US,DE", "--protocol", "http,socks5",
+                                            "--unique-exits", "--limit", "2"])
+            self.assertEqual(status, 0)
+            self.assertEqual(json.loads(output.getvalue()), [
+                {"proxy": "socks5://1.1.1.2:1080", "exit_ip": "8.8.8.8",
+                 "country": "US", "latency_ms": 40},
+            ])
 
 
 if __name__ == "__main__":

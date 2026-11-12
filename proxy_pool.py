@@ -2,23 +2,23 @@
 
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import csv
 from dataclasses import dataclass
 from ipaddress import ip_address
+from itertools import islice, zip_longest
+import json
+from pathlib import Path
 import re
 import threading
 import time
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import requests
 from requests.exceptions import RequestException
 
-PROXY_SOURCES = (
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
-    "https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/all/data.txt",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
-)
 PROTOCOLS = ("http", "socks4", "socks5")
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
+VERIFY_URL = "https://example.com/"
 TEST_TIMEOUT = 5
 TEST_WORKERS = 24
 QUEUE_LOW_MARK = 8
@@ -27,6 +27,49 @@ MAX_TEST_BATCH = 400
 SOURCE_REFRESH = 120
 RETRY_AFTER = 180
 VERIFIED_TTL = 180
+
+
+@dataclass(frozen=True)
+class Feed:
+    name: str
+    url: str
+    protocol: str | None = None
+
+
+BUILTIN_FEEDS = {
+    "monosans": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
+    "proxyscrape": "https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/all/data.txt",
+    "proxifly": "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
+    "proxy-scraper": "https://proxy-scraper.de/all.txt",
+}
+SOURCE_NAMES = (*BUILTIN_FEEDS, "proxyscrape-api")
+
+
+def country_codes(value):
+    if value.strip().lower() in ("", "any"):
+        return frozenset()
+    codes = frozenset(part.strip().upper() for part in value.split(","))
+    if any(not re.fullmatch(r"[A-Z]{2}", code) for code in codes):
+        raise ValueError("Enter two-letter country codes separated by commas, or Any.")
+    return codes
+
+
+def discovery_feeds(names, countries):
+    if "proxyscrape-api" in names:
+        for country in sorted(countries) or [""]:
+            params = dict(request="display_proxies", proxy_format="protocolipport", format="text")
+            if country:
+                params["country"] = country.lower()
+            url = "https://api.proxyscrape.com/v4/free-proxy-list/get?" + urlencode(params)
+            label = f"proxyscrape-api/{country}" if country else "proxyscrape-api"
+            yield Feed(label, url)
+    for name in names:
+        if name in BUILTIN_FEEDS:
+            yield Feed(name, BUILTIN_FEEDS[name])
+
+
+def interleave(groups):
+    return (item for row in zip_longest(*groups) for item in row if item is not None)
 
 
 def parse_proxy_line(line, default_proto="http"):
@@ -66,6 +109,27 @@ def parse_proxy_line(line, default_proto="http"):
         password = quote(unquote(parsed.password or ""), safe="")
         addr = f"{user}:{password}@{addr}"
     return addr, protocol
+
+
+def read_proxy_list(path, default_proto="http"):
+    path = Path(path)
+    with path.open(encoding="utf-8-sig", newline="") as source:
+        if path.suffix.lower() == ".json":
+            rows = json.load(source)
+            if not isinstance(rows, list):
+                raise ValueError("Expected a JSON array of proxy records.")
+            lines = (row.get("proxy") if isinstance(row, dict) else row for row in rows)
+        elif path.suffix.lower() == ".csv":
+            rows = csv.DictReader(source)
+            if rows.fieldnames and "proxy" in rows.fieldnames:
+                lines = (row["proxy"] for row in rows)
+            else:
+                source.seek(0)
+                lines = source
+        else:
+            lines = source
+        return [entry for line in lines if isinstance(line, str)
+                if (entry := parse_proxy_line(line, default_proto))]
 
 
 @dataclass
@@ -128,14 +192,25 @@ def check_connection(proxy=None, timeout=TEST_TIMEOUT):
     return str(ip), country, round((time.monotonic() - started) * 1000)
 
 
-def fetch_source(url):
+def verify_destination(proxy, timeout):
+    started = time.monotonic()
+    try:
+        page = get_text(VERIFY_URL, 16_384, timeout, proxy.requests_dict())
+    except (RequestException, ValueError):
+        return None
+    if "<title>Example Domain</title>" not in page:
+        return None
+    return round((time.monotonic() - started) * 1000)
+
+
+def fetch_source(feed):
     """Accept only public IP literals from untrusted feeds."""
-    text = get_text(url, 2_000_000, 8)
+    text = get_text(feed.url, 2_000_000, 8)
     candidates = {}
     for line in text.splitlines():
-        if "://" not in line:
+        if "://" not in line and feed.protocol is None:
             continue
-        entry = parse_proxy_line(line)
+        entry = parse_proxy_line(line, feed.protocol or "http")
         if entry is None or "@" in entry[0]:
             continue
         host = entry[0].rsplit(":", 1)[0].strip("[]")
@@ -157,7 +232,9 @@ def rank(proxy):
 class ProxyManager:
     """Keep a fresh, bounded pool of the fastest matching verified proxies."""
 
-    def __init__(self, on_log, on_change):
+    def __init__(self, on_log, on_change, *, sources=SOURCE_NAMES, extra_feeds=(),
+                 workers=TEST_WORKERS, timeout=TEST_TIMEOUT, verify_site=True,
+                 capacity=QUEUE_HIGH_MARK, distinct_exits=False):
         self._log = on_log
         self._change = on_change
         self._lock = threading.Lock()
@@ -167,11 +244,17 @@ class ProxyManager:
         self._pool = {}
         self._custom = {}
         self._attempted = {}
-        self._sources = []
-        self._refresh_at = 0
-        self._protocol = "all"
+        self._feeds = {}
+        self._source_names = tuple(sources)
+        self._extra_feeds = tuple(extra_feeds)
+        self._workers = workers
+        self._timeout = timeout
+        self._verify_site = verify_site
+        self._capacity = capacity
+        self._distinct_exits = distinct_exits
+        self._protocols = frozenset(PROTOCOLS)
         self._latency = 0
-        self._country = "Any"
+        self._countries = frozenset()
         self.verified_total = 0
         self.tested_total = 0
 
@@ -194,22 +277,40 @@ class ProxyManager:
                 self._stop.set()
             self._wake.set()
 
-    def configure(self, protocol, latency, country):
+    def configure(self, protocol, latency, country, *, sources=None, verify_site=None):
+        protocols = frozenset(PROTOCOLS if protocol == "all" else
+                              (protocol,) if isinstance(protocol, str) else protocol)
+        countries = country_codes(country) if isinstance(country, str) else frozenset(country)
         with self._lock:
-            if (protocol, latency, country) == (self._protocol, self._latency, self._country):
-                return
-            self._protocol, self._latency, self._country = protocol, latency, country
+            if sources is not None and tuple(sources) != self._source_names:
+                self._source_names = tuple(sources)
+                self._pool = {key: proxy for key, proxy in self._pool.items() if proxy.custom}
+                self._attempted.clear()
+            if verify_site is not None and verify_site != self._verify_site:
+                self._verify_site = verify_site
+                self._pool.clear()
+                self._attempted.clear()
+            if (protocols != self._protocols or latency > self._latency > 0
+                    or not latency and self._latency):
+                self._attempted.clear()
+            self._protocols, self._latency, self._countries = protocols, latency, countries
             self._wake.set()
 
     def add_custom(self, entries):
         with self._lock:
             before = len(self._custom)
-            self._custom.update(dict.fromkeys(entries))
+            for key in entries:
+                if key in self._custom:
+                    continue
+                self._custom[key] = None
+                self._attempted.pop(key, None)
+                if key in self._pool:
+                    self._pool[key].custom = True
             self._wake.set()
             return len(self._custom) - before
 
     def _eligible(self, proxy):
-        return ((self._protocol == "all" or self._protocol == proxy.protocol)
+        return (proxy.protocol in self._protocols
                 and (not self._latency or proxy.latency <= self._latency))
 
     def _prune(self, now):
@@ -225,20 +326,25 @@ class ProxyManager:
     def countries(self):
         return Counter(proxy.cc for proxy in self.snapshot())
 
-    def get_next(self, cc="Any"):
+    def get_next(self, cc="Any", previous_ip=None):
+        countries = country_codes(cc) if isinstance(cc, str) else cc
         with self._lock:
             self._prune(time.monotonic())
-            key = min((key for key, proxy in self._pool.items() if cc in ("Any", proxy.cc)),
-                      key=lambda entry: rank(self._pool[entry]), default=None)
+            eligible = (proxy for proxy in self._pool.values()
+                        if not countries or proxy.cc in countries)
+            proxy = min(eligible, key=lambda item: (item.ip == previous_ip, rank(item)), default=None)
             self._wake.set()
-            return self._pool.pop(key, None)
+            return self._pool.pop((proxy.addr, proxy.protocol)) if proxy else None
 
     def _ready_count(self):
-        return sum(self._country in ("Any", proxy.cc) for proxy in self._pool.values())
+        return sum(not self._countries or proxy.cc in self._countries for proxy in self._pool.values())
+
+    def _pool_rank(self, proxy):
+        return bool(self._countries and proxy.cc not in self._countries), rank(proxy)
 
     def _run(self, stop):
         try:
-            with ThreadPoolExecutor(max_workers=TEST_WORKERS,
+            with ThreadPoolExecutor(max_workers=self._workers,
                                     thread_name_prefix="proxy-check") as workers:
                 while not stop.is_set():
                     self._wake.clear()
@@ -255,77 +361,90 @@ class ProxyManager:
                     self._start_worker()
 
     def _refresh_sources(self, workers, stop):
-        if time.monotonic() < self._refresh_at:
-            return
-        downloads = [workers.submit(fetch_source, url) for url in PROXY_SOURCES]
-        groups = {}
-        successes = 0
-        for download in downloads:
+        with self._lock:
+            feeds = [*discovery_feeds(self._source_names, self._countries), *self._extra_feeds]
+            configuration = self._configuration()
+        self._feeds = {feed: self._feeds[feed] for feed in feeds if feed in self._feeds}
+        now = time.monotonic()
+        downloads = {workers.submit(fetch_source, feed): feed for feed in feeds
+                     if feed not in self._feeds or self._feeds[feed][0] <= now}
+        for download, feed in downloads.items():
             try:
                 entries = download.result()
             except (RequestException, ValueError):
-                continue
+                entries = []
+            checked = time.monotonic()
             if entries:
-                successes += 1
+                self._feeds[feed] = (checked + SOURCE_REFRESH, checked, entries)
+            else:
+                _, last_good, cached = self._feeds.get(feed, (0, 0, []))
+                self._feeds[feed] = (checked + 30, last_good, cached)
+        groups = {True: [], False: []}
+        available = []
+        for feed in feeds:
+            _, last_good, entries = self._feeds[feed]
+            if not entries or time.monotonic() - last_good > 5 * SOURCE_REFRESH:
+                continue
+            available.append(feed.name)
+            protocols = {}
             for entry in entries:
-                groups.setdefault(entry[1], {})[entry] = None
-        # Interleave protocols so large HTTP feeds cannot starve SOCKS.
-        ordered = []
-        sources = [iter(group) for group in groups.values()]
-        while sources:
-            for source in sources[:]:
-                entry = next(source, None)
-                if entry is None:
-                    sources.remove(source)
-                else:
-                    ordered.append(entry)
-        with self._lock:
-            if stop.is_set():
-                return
-            self._refresh_at = time.monotonic() + (SOURCE_REFRESH if successes else 15)
-            if successes:
-                self._sources = ordered
-        self._log(f"Proxy feeds: {successes}/{len(PROXY_SOURCES)} available, {len(ordered)} unique candidates.")
+                if entry[1] in configuration[0]:
+                    protocols.setdefault(entry[1], []).append(entry)
+            groups[feed.name.startswith("proxyscrape-api/")].append(interleave(protocols.values()))
+        ordered = dict.fromkeys(interleave(interleave(group) for group in groups.values()))
+        if downloads and not stop.is_set():
+            names = ", ".join(available) or "none"
+            self._log(f"{len(ordered)} unique candidates from {len(available)}/{len(feeds)} feeds: {names}.")
+        return configuration, ordered
 
-    def _probe(self, key, custom, timeout):
-        proxy = Proxy(*key, ip="", cc="??", latency=0, checked_at=0, custom=custom)
+    def _configuration(self):
+        return self._protocols, self._latency, self._countries, self._source_names, self._verify_site
+
+    def _probe(self, key, timeout, verify_site, latency_cap):
+        proxy = Proxy(*key, ip="", cc="??", latency=0, checked_at=0)
         result = check_connection(proxy, timeout)
         if result is None:
             return None
         proxy.ip, proxy.cc, proxy.latency = result
+        if latency_cap and proxy.latency > latency_cap:
+            return None
+        if verify_site:
+            latency = verify_destination(proxy, timeout)
+            if latency is None:
+                return None
+            proxy.latency = max(proxy.latency, latency)
         proxy.checked_at = time.monotonic()
         return proxy
 
-    def scan(self, workers, stop, budget=MAX_TEST_BATCH):
+    def scan(self, workers, stop, budget=MAX_TEST_BATCH, *, exhaustive=False):
         """Scan at most budget candidates, keeping only one wave of work in flight."""
-        self._refresh_sources(workers, stop)
+        configuration, sources = self._refresh_sources(workers, stop)
         with self._lock:
             now = time.monotonic()
+            self._prune(now)
             self._attempted = {key: stamp for key, stamp in self._attempted.items()
                                if now - stamp < RETRY_AFTER}
-            candidates = [
-                (key, key in self._custom)
-                for key in dict.fromkeys([*self._custom, *self._sources])
+            candidates = list(islice((
+                key for key in dict.fromkeys([*self._custom, *sources])
                 if key not in self._pool and key not in self._attempted
-                and self._protocol in ("all", key[1])
-            ][:budget]
-            protocol, latency = self._protocol, self._latency
-            timeout = min(TEST_TIMEOUT, latency / 1000) if latency else TEST_TIMEOUT
+                and key[1] in configuration[0]
+            ), budget))
+            latency, verify_site = configuration[1], configuration[4]
+            timeout = min(self._timeout, latency / 1000) if latency else self._timeout
         candidates = iter(candidates)
         pending = {}
         while not stop.is_set():
-            while len(pending) < TEST_WORKERS:
+            while len(pending) < self._workers:
                 with self._lock:
-                    if (stop.is_set() or self._ready_count() >= QUEUE_HIGH_MARK
-                            or (protocol, latency) != (self._protocol, self._latency)):
+                    if (stop.is_set() or configuration != self._configuration()
+                            or not exhaustive and self._ready_count() >= self._capacity):
                         break
-                    candidate = next(candidates, None)
-                    if candidate is None:
+                    key = next(candidates, None)
+                    if key is None:
                         break
-                    key, custom = candidate
                     self._attempted[key] = time.monotonic()
                     self.tested_total += 1
-                pending[workers.submit(self._probe, key, custom, timeout)] = key
+                pending[workers.submit(self._probe, key, timeout, verify_site, latency)] = key
             if not pending:
                 return
             done, _ = wait(pending, timeout=0.25, return_when=FIRST_COMPLETED)
@@ -335,13 +454,21 @@ class ProxyManager:
                 if proxy is None:
                     continue
                 with self._lock:
-                    if stop.is_set() or not self._eligible(proxy):
+                    if (stop.is_set() or configuration != self._configuration()
+                            or not self._eligible(proxy)):
                         continue
+                    self._prune(time.monotonic())
+                    proxy.custom = key in self._custom
                     self.verified_total += 1
+                    if self._distinct_exits:
+                        same_exit = next((item for item in self._pool.values()
+                                          if item.ip == proxy.ip), None)
+                        if same_exit and self._pool_rank(same_exit) <= self._pool_rank(proxy):
+                            continue
+                        if same_exit:
+                            del self._pool[same_exit.addr, same_exit.protocol]
                     self._pool[key] = proxy
-                    if len(self._pool) > QUEUE_HIGH_MARK:
-                        worst = max(self._pool, key=lambda item: (
-                            self._country not in ("Any", self._pool[item].cc), rank(self._pool[item])
-                        ))
+                    if len(self._pool) > self._capacity:
+                        worst = max(self._pool, key=lambda item: self._pool_rank(self._pool[item]))
                         del self._pool[worst]
                 self._change()

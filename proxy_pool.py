@@ -36,6 +36,15 @@ class Feed:
     protocol: str | None = None
 
 
+def parse_feed(value):
+    prefix, _, remainder = value.strip().partition("=")
+    protocol, url = (prefix, remainder) if prefix in PROTOCOLS else (None, value.strip())
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username is not None:
+        raise ValueError("Use an HTTPS URL, optionally prefixed with protocol=.")
+    return Feed(f"custom/{parsed.hostname}", url, protocol)
+
+
 BUILTIN_FEEDS = {
     "monosans": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
     "proxyscrape": "https://raw.githubusercontent.com/proxyscrape/free-proxy-list/main/proxies/all/data.txt",
@@ -241,6 +250,7 @@ class ProxyManager:
         self._wake = threading.Event()
         self._stop = None
         self._thread = None
+        self._rescan = False
         self._pool = {}
         self._custom = {}
         self._attempted = {}
@@ -307,7 +317,18 @@ class ProxyManager:
                 if key in self._pool:
                     self._pool[key].custom = True
             self._wake.set()
-            return len(self._custom) - before
+            added = len(self._custom) - before
+            self._rescan = self._rescan or bool(added)
+            return added
+
+    def add_feed(self, feed):
+        with self._lock:
+            if feed in self._extra_feeds:
+                return False
+            self._extra_feeds += (feed,)
+            self._rescan = True
+            self._wake.set()
+            return True
 
     def _eligible(self, proxy):
         return (proxy.protocol in self._protocols
@@ -336,6 +357,17 @@ class ProxyManager:
             self._wake.set()
             return self._pool.pop((proxy.addr, proxy.protocol)) if proxy else None
 
+    def take_proxy(self, addr, protocol):
+        """Claim a visible result if it still satisfies the active filters."""
+        with self._lock:
+            self._prune(time.monotonic())
+            key = (addr, protocol)
+            proxy = self._pool.get(key)
+            if proxy is None or self._countries and proxy.cc not in self._countries:
+                return None
+            self._wake.set()
+            return self._pool.pop(key)
+
     def _ready_count(self):
         return sum(not self._countries or proxy.cc in self._countries for proxy in self._pool.values())
 
@@ -350,9 +382,11 @@ class ProxyManager:
                     self._wake.clear()
                     with self._lock:
                         self._prune(time.monotonic())
-                        refill = self._ready_count() < QUEUE_LOW_MARK
+                        rescan = self._rescan
+                        self._rescan = False
+                        refill = rescan or self._ready_count() < QUEUE_LOW_MARK
                     if refill:
-                        self.scan(workers, stop)
+                        self.scan(workers, stop, exhaustive=rescan)
                     self._wake.wait(3)
         finally:
             with self._lock:
@@ -398,7 +432,8 @@ class ProxyManager:
         return configuration, ordered
 
     def _configuration(self):
-        return self._protocols, self._latency, self._countries, self._source_names, self._verify_site
+        return (self._protocols, self._latency, self._countries, self._source_names,
+                self._verify_site, self._extra_feeds)
 
     def _probe(self, key, timeout, verify_site, latency_cap):
         proxy = Proxy(*key, ip="", cc="??", latency=0, checked_at=0)

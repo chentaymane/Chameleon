@@ -7,7 +7,6 @@ import json
 from pathlib import Path
 import sys
 import threading
-from urllib.parse import urlsplit
 
 from proxy_pool import (
     MAX_TEST_BATCH,
@@ -15,23 +14,18 @@ from proxy_pool import (
     SOURCE_NAMES,
     TEST_TIMEOUT,
     TEST_WORKERS,
-    Feed,
     ProxyManager,
     country_codes,
+    parse_feed,
     read_proxy_list,
 )
 
 
 def custom_feed(value):
-    prefix, _, remainder = value.partition("=")
-    protocol, url = (prefix, remainder) if prefix in PROTOCOLS else (None, value)
     try:
-        parsed = urlsplit(url)
-        if parsed.scheme == "https" and parsed.hostname and parsed.username is None:
-            return Feed(f"custom/{parsed.hostname}", url, protocol)
-    except ValueError:
-        pass
-    raise argparse.ArgumentTypeError("use an HTTPS URL, optionally prefixed with protocol=")
+        return parse_feed(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def write_results(proxies, output_format):

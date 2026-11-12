@@ -94,6 +94,22 @@ socks5://1.1.1.1:80
                 self.assertIsNotNone(manager.get_next())
             self.assertEqual(manager.tested_total, 2)
 
+    def test_claim_selected_proxy_respects_current_country_and_expiry(self):
+        manager = pool.ProxyManager(lambda _: None, lambda: None, sources=(), verify_site=False)
+        first = ("8.8.8.8:80", "http")
+        second = ("8.8.4.4:1080", "socks5")
+        manager.add_custom([first, second])
+        with patch.object(pool, "check_connection", return_value=("1.1.1.1", "US", 40)), \
+                ThreadPoolExecutor(max_workers=2) as workers:
+            manager.scan(workers, Event())
+        manager.configure("all", 0, "DE")
+        self.assertIsNone(manager.take_proxy(*second))
+        manager.configure("all", 0, "US")
+        self.assertEqual(manager.take_proxy(*second).endpoint, second[0])
+        self.assertIsNone(manager.take_proxy(*second))
+        with patch.object(pool.time, "monotonic", return_value=time.monotonic() + pool.VERIFIED_TTL):
+            self.assertIsNone(manager.take_proxy(*first))
+
     def test_targeted_feeds_and_other_protocols_share_the_scan_budget(self):
         manager = pool.ProxyManager(lambda _: None, lambda: None,
                                     sources=("proxyscrape-api", "monosans"), workers=1,

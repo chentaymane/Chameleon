@@ -40,14 +40,14 @@ Chameleon is a single-window desktop app that:
 
 1. **Collects proxies** continuously in the background from many free public
    sources (HTTP, SOCKS4 and SOCKS5) — plus any list you load yourself.
-2. **Tests every proxy** with a two-step check and keeps only the ones that
-   actually pass, measuring each one's **latency** and **country**.
+2. **Verifies candidates over HTTPS**, measures their latency, and records the
+   country reported for their public exit IP.
 3. **Rotates your operating-system proxy** to those verified proxies, either
    automatically on a timer or manually with a button — optionally **pinned to a
    country you choose**.
 4. **Watches the active proxy** and, if it dies, automatically switches to the
    next good one.
-5. **Restores your normal connection** the moment you stop or close the app.
+5. **Disables the system proxy it applied** when you stop or close the app.
 
 Because it drives the **OS-level proxy**, it affects normal browsers and any app
 that follows the system proxy — or you can just **copy** the active proxy string
@@ -78,45 +78,21 @@ and is designed to sit alongside tools that cover the rest:
 
 ## How it works under the hood
 
-```
-        ┌──────────────────────────────────────────────┐
-        │  Background fetcher (daemon thread)           │
-        │  • pulls lists from all enabled sources       │
-        │  • dedups against everything already seen      │
-        └───────────────┬──────────────────────────────┘
-                        │ candidate host:port
-                        ▼
-        ┌──────────────────────────────────────────────┐
-        │  Test pool (up to 16 concurrent workers)      │
-        │  1. GET ip-api.com  → status, IP, COUNTRY,     │
-        │     and measured LATENCY                       │
-        │  2. GET example.com → proves it reaches a real │
-        │     site, not just whitelisted IP APIs         │
-        │  3. drop if slower than "Max latency"          │
-        └───────────────┬──────────────────────────────┘
-                        │ verified Proxy(addr, proto, cc, latency)
-                        ▼
-        ┌──────────────────────────────────────────────┐
-        │  Country-aware queue (thread-safe deque)      │
-        └───────────────┬──────────────────────────────┘
-                        │ get_next(country)
-                        ▼
-        ┌──────────────────────────────────────────────┐
-        │  Rotation loop                                │
-        │  • timer fires → pull next matching proxy      │
-        │  • none ready → hold & show "waiting…"          │
-        │  • apply to OS proxy, verify new IP            │
-        └──────────────────────────────────────────────┘
-                        ▲
-        ┌───────────────┴──────────────────────────────┐
-        │  Health loop (optional)                       │
-        │  • every 20 s re-tests the active proxy        │
-        │  • on failure → rotate immediately             │
-        └──────────────────────────────────────────────┘
-```
+Chameleon fetches [monosans](https://github.com/monosans/proxy-list),
+[ProxyScrape](https://github.com/ProxyScrape/free-proxy-list), and
+[Proxifly](https://github.com/proxifly/free-proxy-list) concurrently. It deduplicates
+public endpoints by address and protocol, gives imported proxies priority, and
+interleaves HTTP, SOCKS4, and SOCKS5 candidates.
 
-A proxy is only ever applied **after** it has passed both tests, so you are never
-left on a dead or untested connection.
+Each of up to 24 workers makes a TLS-verified request to
+[Cloudflare's connection trace endpoint](https://developers.cloudflare.com/fundamentals/reference/cdn-cgi-endpoint/).
+The HTTPS request measures latency and checks the exit IP and reported country.
+The pool holds up to 40 results for three minutes. Rotation chooses the fastest
+eligible proxy, with imported proxies ranked first. If a country is pinned, the
+pool keeps scanning when fewer than eight proxies from that country are ready.
+
+When enabled, the health check repeats the HTTPS probe every 20 seconds. If the
+active proxy fails, Chameleon clears it and waits for an eligible replacement.
 
 ---
 
@@ -136,8 +112,8 @@ left on a dead or untested connection.
 ### Windows
 
 ```bat
-git clone https://github.com/YOUR_USERNAME/chameleon.git
-cd chameleon
+git clone https://github.com/chentaymane/Chameleon.git
+cd Chameleon
 run.bat
 ```
 
@@ -147,11 +123,25 @@ run.bat
 ### Linux / macOS
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/chameleon.git
-cd chameleon
+git clone https://github.com/chentaymane/Chameleon.git
+cd Chameleon
 chmod +x run.sh
 ./run.sh
 ```
+
+### Find live proxies from the command line
+
+```sh
+python -m pip install -r requirements.txt
+python find_proxies.py --limit 10
+python find_proxies.py --protocol socks5 --country US --max-latency 3000 --budget 800
+python find_proxies.py > working_proxies.txt
+```
+
+Results are ordered by measured latency and can be imported with **Load list**.
+Each row contains the proxy URL, exit country, and latency in milliseconds.
+Progress is written to stderr. Exit status 1 means no matching proxy passed.
+A passing result reflects connectivity from the machine running the check.
 
 ---
 
@@ -178,7 +168,7 @@ Chameleon is a single window with four stacked cards plus an action row and log.
 **Action row**
 - **Start / Stop** — begins/ends rotation and the background fetcher.
 - **→ Next Proxy** — rotate immediately (respects the country selector).
-- **Disable** — turn the proxy off and return to a direct connection.
+- **Disable** — stop rotation and turn off the proxy Chameleon applied.
 - **Load list…** — import your own proxies.
 - **Export** — save all currently-working proxies to a file.
 
@@ -224,13 +214,10 @@ socks5://myuser:mypass@185.23.44.10:1080# protocol://user:pass@host:port
 Notes:
 - The **Protocol** dropdown sets the default protocol for lines that don't specify
   one (`https` is treated as `http` for dialling).
-- Custom proxies are **prioritised and retried every cycle**, so a paid proxy that
-  briefly fails isn't discarded forever like a public one.
-- Authenticated proxies keep their credentials for the actual connection; the
-  credentials are stripped only from the OS proxy *host* field where they don't
-  belong.
-- Use **Export** afterwards to save the ones that passed (`protocol://host:port
-  country latency_ms`).
+- Imported proxies are checked before public candidates and can be retried after
+  a three-minute cooldown.
+- Authenticated proxies can be used through **Copy**. The system settings used
+  by Chameleon do not apply imported proxy credentials.
 
 ---
 
@@ -254,7 +241,7 @@ Notes:
 | **Linux** | GNOME `gsettings` (`org.gnome.system.proxy` → manual) | Apps that follow the GNOME proxy (GNOME/Cinnamon/Unity) |
 | **macOS** | `networksetup` web/secure/SOCKS proxy on each active network service | System-wide network services |
 
-On **stop** or **window close**, Chameleon always reverts the proxy to off/direct.
+On **stop** or **window close**, Chameleon disables any system proxy it applied.
 
 > **Firefox and non-GNOME Linux desktops** don't follow these system settings.
 > There, use the **Copy** button and paste the proxy into the app's own proxy
@@ -268,13 +255,13 @@ All near the top of [`chameleon.py`](chameleon.py) if you want to tweak behaviou
 
 | Constant | Default | Meaning |
 |---|---:|---|
-| `TEST_TIMEOUT` | `7` | Seconds allowed per proxy test request. |
-| `TEST_WORKERS` | `16` | Max concurrent test threads. |
+| `TEST_TIMEOUT` | `5` | Maximum connect and read timeout in seconds for a probe. |
+| `TEST_WORKERS` | `24` | Max concurrent test threads. |
 | `QUEUE_LOW_MARK` | `8` | Refetch when the queue drops below this. |
-| `QUEUE_HIGH_MARK` | `40` | Stop testing once the queue reaches this. |
+| `QUEUE_HIGH_MARK` | `40` | Maximum verified proxies retained. |
 | `MAX_TEST_BATCH` | `400` | Proxies tested per fetch cycle. |
 | `HEALTH_INTERVAL` | `20` | Seconds between active-proxy health checks. |
-| `PROXY_SOURCES` | — | The list of `(url, protocol)` sources. Add your own. |
+| `PROXY_SOURCES` | — | URLs for feeds with one protocol-prefixed proxy per line. |
 
 ---
 
@@ -317,7 +304,10 @@ next proxy* and every rotation stays in that country.
 
 ```
 chameleon/
-├── chameleon.py      # the entire application (single file, stdlib + requests)
+├── chameleon.py      # desktop app and system proxy integration
+├── proxy_pool.py     # discovery, HTTPS validation and ranking
+├── find_proxies.py   # command-line discovery
+├── test_proxy_pool.py
 ├── requirements.txt  # requests[socks]
 ├── run.bat           # Windows launcher
 ├── run.sh            # Linux / macOS launcher
@@ -325,10 +315,7 @@ chameleon/
 └── README.md
 ```
 
-The whole app lives in `chameleon.py`, organised as:
-`Proxy` (data model) · `SystemProxy` (per-OS proxy control) ·
-`ProxyManager` (fetch/test/queue) · `parse_proxy_line` (list import) ·
-`App` (the tkinter UI).
+Run the regression tests with `python -m unittest -v`.
 
 ---
 

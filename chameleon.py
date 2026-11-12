@@ -6,8 +6,7 @@ from tkinter import ttk, scrolledtext, filedialog, messagebox, simpledialog
 import csv
 import threading
 import queue
-import platform
-import subprocess
+import sys
 import time
 from datetime import datetime
 
@@ -25,16 +24,7 @@ from proxy_pool import (
     verify_destination,
 )
 
-# ── Platform detection & guarded imports ──────────────────────────────────────
-
-_SYS       = platform.system()
-IS_WINDOWS = _SYS == "Windows"
-IS_LINUX   = _SYS == "Linux"
-IS_MAC     = _SYS == "Darwin"
-
-if IS_WINDOWS:
-    import winreg
-    import ctypes
+from system_proxy import SYSTEM, SystemProxy
 
 HEALTH_INTERVAL = 20
 SOURCE_OPTIONS = {
@@ -58,118 +48,6 @@ F = dict(
     body=("Segoe UI", 9), small=("Segoe UI", 8), mono=("Consolas", 9),
     stat=("Segoe UI Semibold", 14), btn=("Segoe UI Semibold", 10),
 )
-
-
-# ── System proxy control (cross-platform) ─────────────────────────────────────
-
-class SystemProxy:
-    """Applies/removes the OS-level proxy so browsers follow it."""
-
-    # --- Windows (WinINET registry) ---
-    @staticmethod
-    def _win_key(write=False):
-        flag = winreg.KEY_WRITE if write else winreg.KEY_READ
-        return winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-            0, flag,
-        )
-
-    @staticmethod
-    def _win_notify():
-        ctypes.windll.wininet.InternetSetOptionW(0, 39, 0, 0)  # SETTINGS_CHANGED
-        ctypes.windll.wininet.InternetSetOptionW(0, 37, 0, 0)  # REFRESH
-
-    @classmethod
-    def _win_enable(cls, host, port, protocol):
-        value = f"socks={host}:{port}" if protocol in ("socks4", "socks5") else f"{host}:{port}"
-        key = cls._win_key(write=True)
-        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, value)
-        winreg.CloseKey(key)
-        cls._win_notify()
-
-    @classmethod
-    def _win_disable(cls):
-        key = cls._win_key(write=True)
-        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-        winreg.CloseKey(key)
-        cls._win_notify()
-
-    # --- Linux (GNOME gsettings) ---
-    @staticmethod
-    def _gset(*args):
-        subprocess.run(["gsettings", *args], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    @classmethod
-    def _linux_enable(cls, host, port, protocol):
-        cls._gset("set", "org.gnome.system.proxy", "mode", "manual")
-        if protocol in ("socks4", "socks5"):
-            cls._gset("set", "org.gnome.system.proxy.socks", "host", host)
-            cls._gset("set", "org.gnome.system.proxy.socks", "port", str(port))
-        else:
-            for scheme in ("http", "https"):
-                cls._gset("set", f"org.gnome.system.proxy.{scheme}", "host", host)
-                cls._gset("set", f"org.gnome.system.proxy.{scheme}", "port", str(port))
-
-    @classmethod
-    def _linux_disable(cls):
-        cls._gset("set", "org.gnome.system.proxy", "mode", "none")
-
-    # --- macOS (networksetup) ---
-    @staticmethod
-    def _mac_services():
-        out = subprocess.run(["networksetup", "-listallnetworkservices"],
-                             capture_output=True, text=True)
-        return [s for s in out.stdout.splitlines()[1:] if s and not s.startswith("*")]
-
-    @classmethod
-    def _mac_enable(cls, host, port, protocol):
-        socks = protocol in ("socks4", "socks5")
-        for svc in cls._mac_services():
-            if socks:
-                subprocess.run(["networksetup", "-setsocksfirewallproxy", svc, host, str(port)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                for cmd in ("-setwebproxy", "-setsecurewebproxy"):
-                    subprocess.run(["networksetup", cmd, svc, host, str(port)],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    @classmethod
-    def _mac_disable(cls):
-        for svc in cls._mac_services():
-            for cmd in ("-setwebproxystate", "-setsecurewebproxystate", "-setsocksfirewallproxystate"):
-                subprocess.run(["networksetup", cmd, svc, "off"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # --- Public API ---
-    @classmethod
-    def enable(cls, host, port, protocol) -> bool:
-        try:
-            if IS_WINDOWS:  cls._win_enable(host, port, protocol)
-            elif IS_LINUX:  cls._linux_enable(host, port, protocol)
-            elif IS_MAC:    cls._mac_enable(host, port, protocol)
-            else:           return False
-            return True
-        except Exception:
-            return False
-
-    @classmethod
-    def disable(cls):
-        try:
-            if IS_WINDOWS:  cls._win_disable()
-            elif IS_LINUX:  cls._linux_disable()
-            elif IS_MAC:    cls._mac_disable()
-        except Exception:
-            pass
-
-    @staticmethod
-    def platform_note() -> str:
-        if IS_WINDOWS: return "Windows system proxy (Chrome, Edge, WinINET apps)."
-        if IS_LINUX:   return "GNOME gsettings proxy (apps that follow it)."
-        if IS_MAC:     return "macOS networksetup proxy on active services."
-        return "Unsupported OS — copy the proxy into your browser manually."
 
 
 # ── GUI ───────────────────────────────────────────────────────────────────────
@@ -251,7 +129,7 @@ class App:
         bar.pack(fill="x")
         tk.Label(bar, text="🦎  " + self.APP_NAME, font=F["h1"],
                  bg=C["panel"], fg=C["text"], pady=7).pack(side="left", padx=16)
-        tk.Label(bar, text=f"smart IP rotation  ·  {_SYS}", font=F["body"],
+        tk.Label(bar, text=f"smart IP rotation  ·  {SYSTEM}", font=F["body"],
                  bg=C["panel"], fg=C["hint"]).pack(side="left")
 
         root = tk.Frame(self.root, bg=C["bg"])
@@ -285,7 +163,7 @@ class App:
         self._btn(top, "Refresh", self._refresh_ip_async, "ghost",
                   padx=10, pady=4, font=F["body"]).pack(side="right")
 
-        self._active_var = tk.StringVar(value="Proxy: none  ·  direct connection")
+        self._active_var = tk.StringVar(value="System proxy managed by Chameleon: none")
         row = tk.Frame(body, bg=C["surface"])
         row.pack(fill="x", pady=(8, 0))
         tk.Label(row, textvariable=self._active_var, bg=C["surface"], fg=C["dim"],
@@ -474,7 +352,10 @@ class App:
                     self._results.move(key, "", index)
         self._result_rows = rows
         self._update_result_actions()
-        if proxies:
+        selected = self._selected_result()
+        if selected and not self._can_apply(selected):
+            label = "Copy this proxy to use it in an application."
+        elif proxies:
             label = f"{len(proxies)} ready  ·  fastest {min(proxy.latency for proxy in proxies)} ms"
         elif self._running:
             label = "Scanning for matching proxies…"
@@ -495,7 +376,7 @@ class App:
         proxy = self._selected_result()
         self._copy_selected_btn.config(state="normal" if proxy else "disabled")
         self._use_selected_btn.config(
-            state="normal" if proxy and proxy.addr == proxy.endpoint else "disabled"
+            state="normal" if proxy and self._can_apply(proxy) else "disabled"
         )
 
     def _copy_selected(self):
@@ -510,7 +391,7 @@ class App:
 
     def _use_selected(self):
         proxy = self._selected_result()
-        if proxy is None or proxy.addr != proxy.endpoint:
+        if proxy is None or not self._can_apply(proxy):
             return
         proxy = self._manager.take_proxy(proxy.addr, proxy.protocol)
         if proxy is None:
@@ -543,13 +424,19 @@ class App:
         except ValueError as exc:
             self._log(str(exc))
             self._country_var.set(", ".join(sorted(self._selected_countries)) or "Any")
-        protocol = self._proto_var.get()
-        protocols = PROTOCOLS if protocol == "all" else protocol.split(",")
+        protocols = self._selected_protocols()
         self._manager.configure(protocols, 0 if lat == "Any" else int(lat),
                                 self._selected_countries,
                                 sources=SOURCE_OPTIONS[self._source_var.get()],
                                 verify_site=self._dual_var.get())
+        if self._rotating and not set(protocols).intersection(SystemProxy.protocols()):
+            self._stop_rotation()
+            self._cd_var.set("Select a system-compatible proxy type to start rotation.")
         self._refresh_status()
+
+    def _selected_protocols(self):
+        protocol = self._proto_var.get()
+        return PROTOCOLS if protocol == "all" else protocol.split(",")
 
     # ── Status refresh ────────────────────────────────────────────────────────
     def _refresh_status(self):
@@ -558,7 +445,7 @@ class App:
         matching = [proxy for proxy in proxies
                     if not self._selected_countries or proxy.cc in self._selected_countries]
         self._stat_queue.set(str(len(matching)))
-        self._next_btn.config(state="normal" if matching else "disabled")
+        self._next_btn.config(state="normal" if any(map(self._can_apply, matching)) else "disabled")
         self._refresh_results(matching)
         self._stat_verif.set(str(self._manager.verified_total))
         self._stat_tested.set(str(self._manager.tested_total))
@@ -632,16 +519,20 @@ class App:
             self._ip_var.set(ip + tag)
             self._dot.config(fg=C["green"])
         else:
-            self._ip_var.set("Proxy unreachable" if proxy else "Direct IP unavailable")
+            self._ip_var.set("Proxy unreachable" if proxy else "IP lookup unavailable")
             self._dot.config(fg=C["red"])
 
     def _clear_active_proxy(self):
-        if self._system_proxy_active:
-            SystemProxy.disable()
+        if self._system_proxy_active or SystemProxy.needs_restore():
+            if not SystemProxy.disable():
+                self._log(f"Could not restore system proxy settings: {SystemProxy.last_error}")
+                self._notice_result("Could not restore the system proxy. See Activity.")
+                return False
             self._system_proxy_active = False
         self._current = None
-        self._active_var.set("Proxy: none  ·  direct connection")
+        self._active_var.set("System proxy managed by Chameleon: none")
         self._refresh_ip_async()
+        return True
 
     def _disable_proxy_and_refresh(self):
         self._stop_rotation()
@@ -742,6 +633,9 @@ class App:
         if interval == "Manual":
             self._cd_var.set("Manual mode. Use Next proxy or select a result.")
             return
+        if not set(self._selected_protocols()).intersection(SystemProxy.protocols()):
+            self._cd_var.set("Select a system-compatible proxy type to start rotation.")
+            return
         if not self._running:
             self._start()
         self._interval = int(interval)
@@ -759,19 +653,20 @@ class App:
         self._wait_var.set("")
         self._progress["value"] = 0
 
+    @staticmethod
+    def _can_apply(proxy):
+        return proxy.addr == proxy.endpoint and proxy.protocol in SystemProxy.protocols()
+
     def _apply_proxy(self, proxy: Proxy):
         host, port = proxy.endpoint.rsplit(":", 1)
-        if proxy.addr != proxy.endpoint:
-            if self._system_proxy_active:
-                SystemProxy.disable()
-                self._system_proxy_active = False
-            label = "Copy to use"
-        elif SystemProxy.enable(host, port, proxy.protocol):
-            self._system_proxy_active = True
-            label = "Proxy"
-        else:
-            self._log(f"✗  Could not set system proxy {proxy.endpoint}")
+        if not SystemProxy.enable(host, port, proxy.protocol):
+            self._log(f"Could not apply {proxy.endpoint}: {SystemProxy.last_error}")
+            if self._rotating:
+                self._stop_rotation()
+            self._notice_result("Could not apply the system proxy. See Activity.")
             return False
+        self._system_proxy_active = True
+        label = "Proxy"
         self._current = proxy
         self._rotations += 1
         self._next_health_check = time.monotonic() + HEALTH_INTERVAL
@@ -789,7 +684,7 @@ class App:
 
     def _try_rotate(self):
         previous_ip = self._current.ip if self._current else None
-        proxy = self._manager.get_next(self._selected_countries, previous_ip)
+        proxy = self._manager.get_next(self._selected_countries, previous_ip, accept=self._can_apply)
         return proxy is not None and self._activate_proxy(proxy)
 
     def _activate_proxy(self, proxy):
@@ -805,7 +700,7 @@ class App:
         if self._rotating:
             remaining = self._rotation_due - now
             if remaining <= 0:
-                if not self._try_rotate():
+                if not self._try_rotate() and self._rotating:
                     countries = ", ".join(sorted(self._selected_countries))
                     where = f" ({countries})" if countries else ""
                     self._wait_var.set(f"Waiting for a verified proxy{where}…")
@@ -834,8 +729,7 @@ class App:
         self._next_health_check = time.monotonic() + HEALTH_INTERVAL
         if result is None and self._health_var.get():
             self._log(f"⚠  {proxy.endpoint} failed the HTTPS health check.")
-            self._clear_active_proxy()
-            if self._rotating:
+            if self._clear_active_proxy() and self._rotating:
                 self._rotation_due = time.monotonic()
         elif result:
             proxy.ip = result[0]
@@ -873,16 +767,22 @@ class App:
     def _on_close(self):
         self._running = False
         self._manager.stop()
-        if self._system_proxy_active:
-            SystemProxy.disable()
+        if (self._system_proxy_active or SystemProxy.needs_restore()) and not SystemProxy.disable():
+            messagebox.showerror("Proxy settings could not be restored", SystemProxy.last_error,
+                                 parent=self.root)
         self.root.destroy()
 
     def run(self):
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._refresh_ip_async()
-        self._log(f"{self.APP_NAME} ready on {_SYS}. {SystemProxy.platform_note()}")
+        self._log(f"{self.APP_NAME} ready on {SYSTEM}. {SystemProxy.platform_note()}")
         self.root.mainloop()
 
 
 if __name__ == "__main__":
-    App().run()
+    try:
+        app = App()
+    except tk.TclError as error:
+        print(f"Could not open the Chameleon desktop window: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    app.run()

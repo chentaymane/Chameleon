@@ -347,12 +347,13 @@ class ProxyManager:
     def countries(self):
         return Counter(proxy.cc for proxy in self.snapshot())
 
-    def get_next(self, cc="Any", previous_ip=None):
+    def get_next(self, cc="Any", previous_ip=None, *, accept=None):
         countries = country_codes(cc) if isinstance(cc, str) else cc
         with self._lock:
             self._prune(time.monotonic())
             eligible = (proxy for proxy in self._pool.values()
-                        if not countries or proxy.cc in countries)
+                        if (not countries or proxy.cc in countries)
+                        and (accept is None or accept(proxy)))
             proxy = min(eligible, key=lambda item: (item.ip == previous_ip, rank(item)), default=None)
             self._wake.set()
             return self._pool.pop((proxy.addr, proxy.protocol)) if proxy else None

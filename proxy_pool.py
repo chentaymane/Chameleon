@@ -10,6 +10,7 @@ import time
 from urllib.parse import quote, unquote, urlsplit
 
 import requests
+from requests.exceptions import RequestException
 
 PROXY_SOURCES = (
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
@@ -43,8 +44,9 @@ def parse_proxy_line(line, default_proto="http"):
     if protocol not in PROTOCOLS:
         return None
 
-    if "@" not in line and not line.startswith("[") and line.count(":") >= 3:
-        host, port, user, password = line.split(":", 3)
+    legacy = line.split(":", 3)
+    if not line.startswith("[") and len(legacy) == 4 and legacy[1].isdigit():
+        host, port, user, password = legacy
         line = f"{quote(user, safe='')}:{quote(password, safe='')}@{host}:{port}"
     try:
         parsed = urlsplit(f"{protocol}://{line}")
@@ -118,7 +120,7 @@ def check_connection(proxy=None, timeout=TEST_TIMEOUT):
         ip = ip_address(fields.get("ip", ""))
         if not ip.is_global or fields.get("visit_scheme") != "https":
             return None
-    except (requests.RequestException, ValueError):
+    except (RequestException, ValueError):
         return None
     country = fields.get("loc", "")
     if not re.fullmatch(r"[A-Z]{2}", country) or country in {"XX", "T1"}:
@@ -261,7 +263,7 @@ class ProxyManager:
         for download in downloads:
             try:
                 entries = download.result()
-            except (requests.RequestException, ValueError):
+            except (RequestException, ValueError):
                 continue
             if entries:
                 successes += 1
